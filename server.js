@@ -22,8 +22,85 @@ function findCheapest(results) {
     if (!best || n < toNumber(best.price)) best = r;
   }
   return best
-    ? { store: best.store, price: best.price, name: best.name, unit: best.unit || "" }
+    ? { store: best.store, price: best.price, name: best.name, unit: best.unit || "", imageUrl: best.imageUrl || null }
     : null;
+}
+
+/**
+ * Extract the best image URL from a Next.js product card.
+ *
+ * Trolley is a Next.js app. next/image wraps real URLs in:
+ *   /_next/image?url=<encoded-real-url>&w=96&q=75
+ *
+ * Before IntersectionObserver fires (lazy load), img.src is a tiny base64
+ * blurred placeholder. The real URL is always available in:
+ *   img.srcset  →  "/_next/image?url=...&w=96 1x, /_next/image?url=...&w=128 2x"
+ *   <source srcset="..."> inside a <picture> wrapper
+ *
+ * We decode the `url` param to get the actual CDN image URL.
+ */
+function extractImageUrl(card) {
+  // Helper: decode a Next.js image proxy URL → real CDN URL
+  const decodeNextImage = (nextUrl) => {
+    if (!nextUrl) return null;
+    try {
+      // Could be relative /_next/image?url=... or absolute
+      const base = nextUrl.startsWith("http") ? nextUrl : `https://www.trolley.co.uk${nextUrl}`;
+      const parsed = new URL(base);
+      const realUrl = parsed.searchParams.get("url");
+      return realUrl ? decodeURIComponent(realUrl) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Helper: pick the largest width from a srcset string and decode it
+  const bestFromSrcset = (srcset) => {
+    if (!srcset) return null;
+    // srcset entries: "url w1x, url2 w2x"  or  "url 96w, url2 128w"
+    const entries = srcset.split(",").map(s => s.trim()).filter(Boolean);
+    if (!entries.length) return null;
+    // Take the last entry (largest)
+    const url = entries[entries.length - 1].split(/\s+/)[0];
+    return url || null;
+  };
+
+  // 1. Try <picture><source srcset="..."> — most reliable for Next.js
+  const source = card.querySelector("picture source");
+  if (source) {
+    const srcset = source.srcset || source.getAttribute("srcset");
+    const url = bestFromSrcset(srcset);
+    if (url) {
+      const decoded = decodeNextImage(url) || url;
+      if (decoded && !decoded.startsWith("data:")) return decoded;
+    }
+  }
+
+  // 2. Try img srcset
+  const img = card.querySelector("img");
+  if (img) {
+    const srcset = img.srcset || img.getAttribute("srcset");
+    const url = bestFromSrcset(srcset);
+    if (url) {
+      const decoded = decodeNextImage(url) || url;
+      if (decoded && !decoded.startsWith("data:")) return decoded;
+    }
+
+    // 3. Try img.src — only useful if IntersectionObserver already fired
+    if (img.src && !img.src.startsWith("data:")) {
+      const decoded = decodeNextImage(img.src) || img.src;
+      if (decoded && decoded.startsWith("http")) return decoded;
+    }
+
+    // 4. data attributes (some lazy loaders)
+    const lazy = img.dataset.src || img.dataset.lazySrc || img.dataset.srcset;
+    if (lazy && !lazy.startsWith("data:")) {
+      const decoded = decodeNextImage(lazy) || lazy;
+      if (decoded) return decoded;
+    }
+  }
+
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,9 +136,10 @@ async function newPage() {
   });
   const page = await ctx.newPage();
 
+  // Block only fonts/media/stylesheets — allow images so next/image loads
   await page.route("**/*", (route) => {
-    // Allow images now so we can grab product image URLs
-    if (["font", "media", "stylesheet"].includes(route.request().resourceType())) {
+    const type = route.request().resourceType();
+    if (["font", "media", "stylesheet"].includes(type)) {
       route.abort();
     } else {
       route.continue();
@@ -72,7 +150,26 @@ async function newPage() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TROLLEY DOM SCRAPER — now also extracts product image URLs
+// SCROLL-TO-LOAD — trigger IntersectionObserver for lazy images
+// Scrolls through the page in steps so all product images fire their lazy load
+// ─────────────────────────────────────────────────────────────────────────────
+async function triggerLazyImages(page) {
+  await page.evaluate(async () => {
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+    const totalHeight = document.body.scrollHeight;
+    const step = Math.floor(window.innerHeight * 0.8);
+    for (let y = 0; y < totalHeight; y += step) {
+      window.scrollTo(0, y);
+      await delay(120); // small pause for IntersectionObserver callbacks
+    }
+    window.scrollTo(0, 0);
+  });
+  // Give network a moment to respond to triggered image loads
+  await page.waitForTimeout(600);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TROLLEY DOM SCRAPER
 // ─────────────────────────────────────────────────────────────────────────────
 async function scrapeTrolley(page) {
   return page.evaluate(() => {
@@ -103,6 +200,65 @@ async function scrapeTrolley(page) {
     };
     const KNOWN_STORES = new Set(Object.keys(STORE_MAP));
 
+    // ── Inline image extractor (runs in browser context) ──────────────────
+    function extractImageUrl(card) {
+      const decodeNextImage = (nextUrl) => {
+        if (!nextUrl) return null;
+        try {
+          const base = nextUrl.startsWith("http")
+            ? nextUrl
+            : `https://www.trolley.co.uk${nextUrl}`;
+          const parsed = new URL(base);
+          const realUrl = parsed.searchParams.get("url");
+          return realUrl ? decodeURIComponent(realUrl) : null;
+        } catch { return null; }
+      };
+
+      const bestFromSrcset = (srcset) => {
+        if (!srcset) return null;
+        const entries = srcset.split(",").map(s => s.trim()).filter(Boolean);
+        if (!entries.length) return null;
+        const url = entries[entries.length - 1].split(/\s+/)[0];
+        return url || null;
+      };
+
+      // 1. <picture><source srcset>
+      const source = card.querySelector("picture source");
+      if (source) {
+        const url = bestFromSrcset(source.srcset || source.getAttribute("srcset"));
+        if (url) {
+          const decoded = decodeNextImage(url) || url;
+          if (decoded && !decoded.startsWith("data:")) return decoded;
+        }
+      }
+
+      const img = card.querySelector("img");
+      if (img) {
+        // 2. img srcset
+        const srcset = img.srcset || img.getAttribute("srcset");
+        const url = bestFromSrcset(srcset);
+        if (url) {
+          const decoded = decodeNextImage(url) || url;
+          if (decoded && !decoded.startsWith("data:")) return decoded;
+        }
+
+        // 3. img.src (only once lazy-loaded)
+        if (img.src && !img.src.startsWith("data:")) {
+          const decoded = decodeNextImage(img.src) || img.src;
+          if (decoded && decoded.startsWith("http")) return decoded;
+        }
+
+        // 4. data-* lazy attributes
+        const lazy = img.dataset.src || img.dataset.lazySrc || img.dataset.srcset;
+        if (lazy && !lazy.startsWith("data:")) {
+          return decodeNextImage(lazy) || lazy;
+        }
+      }
+
+      return null;
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     const items = [];
     const cards = document.querySelectorAll(".product-item");
 
@@ -112,17 +268,13 @@ async function scrapeTrolley(page) {
 
       const lines = raw.split(/\n/).map(l => l.trim()).filter(Boolean);
 
-      // Price line — exactly £X.XX
       const priceLineIdx = lines.findIndex(l => /^£[\d]+\.[\d]{2}$/.test(l));
       if (priceLineIdx === -1) continue;
 
       const price = lines[priceLineIdx];
-
-      // Unit price — next line if it contains "per"
       const unitLine = lines[priceLineIdx + 1] || "";
       const unit = /per/.test(unitLine) ? unitLine : "";
 
-      // Store — first line before price matching a known store
       let store = "Other";
       let storeLineIdx = -1;
       for (let i = 0; i < priceLineIdx; i++) {
@@ -133,7 +285,6 @@ async function scrapeTrolley(page) {
         }
       }
 
-      // Product name — longest non-numeric, non-size, non-store line before price
       let productName = null;
       for (let i = 0; i < priceLineIdx; i++) {
         if (i === storeLineIdx) continue;
@@ -147,20 +298,17 @@ async function scrapeTrolley(page) {
 
       if (!productName) continue;
 
-      // Extract product image URL from the card's img tag
-      const img = card.querySelector("img");
-      const imageUrl = img ? (img.src || img.dataset.src || img.dataset.lazySrc || "") : "";
+      const imageUrl = extractImageUrl(card);
 
-      items.push({ 
-        name: productName.slice(0, 150), 
-        store, 
-        price, 
+      items.push({
+        name: productName.slice(0, 150),
+        store,
+        price,
         unit,
         imageUrl: imageUrl || null,
       });
     }
 
-    // Deduplicate
     const seen = new Map();
     for (const item of items) {
       const key = `${item.name}|${item.store}|${item.price}`;
@@ -171,7 +319,7 @@ async function scrapeTrolley(page) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SEARCH TROLLEY — now supports a callback for streaming results progressively
+// SEARCH TROLLEY — SSE streaming
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchTrolley(query, clicks = 4, onBatch = null) {
   const { page, ctx } = await newPage();
@@ -181,18 +329,17 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
       { waitUntil: "domcontentloaded", timeout: 25000 }
     );
 
-    // Wait for first products to appear — emit as soon as they do, don't wait longer
     await Promise.race([
       page.waitForSelector(".product-item", { timeout: 10000 }),
       page.waitForTimeout(8000),
     ]).catch(() => {});
-    // Short settle — just enough for JS to paint card text, not a full 1.5s stall
-    await page.waitForTimeout(400);
+
+    // Scroll to trigger lazy image loading, then scroll back
+    await triggerLazyImages(page);
 
     const initialCount = await page.$$eval(".product-item", els => els.length);
     console.log(`  Trolley initial: ${initialCount} products`);
 
-    // Scrape & emit the initial batch immediately
     const seen = new Set();
     let allResults = [];
 
@@ -204,6 +351,11 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
         seen.add(key);
         return true;
       });
+
+      // Log image extraction success rate for debugging
+      const withImages = newItems.filter(r => r.imageUrl).length;
+      console.log(`  Batch: ${newItems.length} new items, ${withImages} with images`);
+
       allResults = [...allResults, ...newItems];
       if (onBatch && newItems.length > 0) {
         onBatch(newItems, allResults, isLast);
@@ -224,7 +376,6 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
       }
 
       const prevCount = await page.$$eval(".product-item", els => els.length);
-
       await btn.scrollIntoViewIfNeeded().catch(() => {});
       await btn.click().catch(() => {});
 
@@ -235,7 +386,8 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
         ".product-item"
       ).catch(() => {});
 
-      await page.waitForTimeout(300); // short settle then emit immediately
+      // Scroll to trigger lazy images on newly loaded cards
+      await triggerLazyImages(page);
 
       const newCount = await page.$$eval(".product-item", els => els.length);
       console.log(`  Trolley click ${i + 1}: ${newCount} products`);
@@ -274,32 +426,6 @@ async function searchAll(query, clicks = 4, onBatch = null) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OPEN FOOD FACTS IMAGE LOOKUP
-// Returns a product image URL for a given query (best-effort)
-// ─────────────────────────────────────────────────────────────────────────────
-app.get("/image", async (req, res) => {
-  const query = req.query.q;
-  if (!query) return res.status(400).json({ error: "Missing ?q= param" });
-
-  try {
-    // Open Food Facts search — free, no key needed
-    const searchUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=5&fields=product_name,image_front_url,image_url`;
-    const response = await fetch(searchUrl, {
-      headers: { "User-Agent": "GroceryPriceApp/1.0 (contact@example.com)" },
-      signal: AbortSignal.timeout(6000),
-    });
-    const data = await response.json();
-    const products = (data.products || []).filter(p => p.image_front_url || p.image_url);
-    if (products.length === 0) return res.json({ imageUrl: null });
-    const imageUrl = products[0].image_front_url || products[0].image_url;
-    res.json({ imageUrl });
-  } catch (err) {
-    console.log("  Image lookup error:", err.message);
-    res.json({ imageUrl: null });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/", (_, res) => {
@@ -308,12 +434,12 @@ app.get("/", (_, res) => {
     "  GET  /search?q=milk[&clicks=4]\n" +
     "  GET  /search/stream?q=milk[&clicks=4]   ← SSE streaming\n" +
     "  POST /compare  { items: ['milk','bread'], clicks: 4 }\n" +
-    "  GET  /image?q=semi-skimmed milk         ← product image URL\n" +
+    "  GET  /debug-images?q=milk               ← inspect image extraction\n" +
     "  GET  /debug?q=chicken"
   );
 });
 
-// ── Non-streaming search (original behaviour) ──────────────────────────────
+// ── Non-streaming search ───────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
@@ -327,10 +453,7 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ── SSE streaming search — sends batches as they arrive ───────────────────
-// Client receives newline-delimited JSON events:
-//   data: {"type":"batch","items":[...],"total":20,"done":false}
-//   data: {"type":"batch","items":[...],"total":40,"done":true}
+// ── SSE streaming search ───────────────────────────────────────────────────
 app.get("/search/stream", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
@@ -339,10 +462,8 @@ app.get("/search/stream", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // stop nginx/Railway buffering
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
-
-  // Immediate ping so the client knows the stream is alive
   res.write(": connected\n\n");
 
   const send = (obj) => {
@@ -392,9 +513,80 @@ app.post("/compare", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DEBUG
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Debug: raw image extraction report ────────────────────────────────────
+app.get("/debug-images", async (req, res) => {
+  const query = req.query.q || "milk";
+  const { page, ctx } = await newPage();
+  try {
+    await page.goto(
+      `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
+      { waitUntil: "domcontentloaded", timeout: 25000 }
+    );
+    await Promise.race([
+      page.waitForSelector(".product-item", { timeout: 10000 }),
+      page.waitForTimeout(8000),
+    ]).catch(() => {});
+
+    // Report BEFORE scroll
+    const beforeScroll = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll(".product-item")].slice(0, 3);
+      return cards.map(card => {
+        const img = card.querySelector("img");
+        const source = card.querySelector("picture source");
+        return {
+          imgSrc: img?.src?.slice(0, 120) || null,
+          imgSrcset: img?.srcset?.slice(0, 200) || null,
+          sourceSrcset: source?.srcset?.slice(0, 200) || null,
+          dataLazySrc: img?.dataset?.lazySrc || null,
+          dataSrc: img?.dataset?.src || null,
+        };
+      });
+    });
+
+    // Scroll to trigger lazy load
+    await triggerLazyImages(page);
+
+    // Report AFTER scroll
+    const afterScroll = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll(".product-item")].slice(0, 3);
+      return cards.map(card => {
+        const img = card.querySelector("img");
+        const source = card.querySelector("picture source");
+        return {
+          imgSrc: img?.src?.slice(0, 120) || null,
+          imgSrcset: img?.srcset?.slice(0, 200) || null,
+          sourceSrcset: source?.srcset?.slice(0, 200) || null,
+        };
+      });
+    });
+
+    // Full scrape
+    const results = await scrapeTrolley(page);
+    const withImages = results.filter(r => r.imageUrl).length;
+
+    res.json({
+      query,
+      totalProducts: results.length,
+      withImages,
+      withoutImages: results.length - withImages,
+      imageSuccessRate: results.length ? `${Math.round(withImages / results.length * 100)}%` : "0%",
+      rawImgAttrsBeforeScroll: beforeScroll,
+      rawImgAttrsAfterScroll: afterScroll,
+      sampleResults: results.slice(0, 5).map(r => ({
+        name: r.name,
+        store: r.store,
+        price: r.price,
+        imageUrl: r.imageUrl,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+});
+
+// ── Debug: general DOM inspection ─────────────────────────────────────────
 app.get("/debug", async (req, res) => {
   const query = req.query.q || "milk";
   const { page, ctx } = await newPage();
