@@ -5,6 +5,8 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(cors());
 
+const PORT = process.env.PORT || 3000;
+
 const BASE_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -32,28 +34,14 @@ async function safeFetch(url, headers = {}, timeout = 15000) {
 }
 
 // ---------------------------------------------------------------------------
-// STEP 1: Extract product IDs + names from HTML
+// Extract product IDs (robust)
 // ---------------------------------------------------------------------------
 function extractProducts(html) {
   const seen = new Set();
   const products = [];
 
-  // Match product cards
-  const regex =
-    /<a[^>]+href="\/product\/[^/]+\/([A-Z0-9]+)"[^>]*>[\s\S]*?<span>\s*([^<]+?)\s*</g;
-
-  for (const m of html.matchAll(regex)) {
-    const id = m[1];
-    const name = m[2].trim();
-
-    if (!seen.has(id)) {
-      seen.add(id);
-      products.push({ id, name });
-    }
-  }
-
-  // Fallback: data-id
-  for (const m of html.matchAll(/data-id="([A-Z0-9]+)"/g)) {
+  // From /product/.../ID
+  for (const m of html.matchAll(/\/product\/[^/]+\/([A-Z0-9]{5,})/g)) {
     const id = m[1];
     if (!seen.has(id)) {
       seen.add(id);
@@ -61,11 +49,22 @@ function extractProducts(html) {
     }
   }
 
+  // From data-id="ID"
+  for (const m of html.matchAll(/data-id="([A-Z0-9]{5,})"/g)) {
+    const id = m[1];
+    if (!seen.has(id)) {
+      seen.add(id);
+      products.push({ id, name: id });
+    }
+  }
+
+  console.log("Extracted IDs:", products.map(p => p.id));
+
   return products.slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
-// STEP 2: Fetch prices from trueview
+// Fetch prices from trueview
 // ---------------------------------------------------------------------------
 async function fetchPrices(products) {
   if (products.length === 0) return [];
@@ -77,6 +76,8 @@ async function fetchPrices(products) {
     `https://www.trolley.co.uk/_library/ajax/trueview.php` +
     `?product_id=${ids.join("|")}&p=${pos.join("|")}&sid=`;
 
+  console.log("Fetching prices for:", ids.join(", "));
+
   const res = await safeFetch(url, {
     Accept: "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
@@ -85,10 +86,13 @@ async function fetchPrices(products) {
 
   const text = await res.text();
 
+  console.log("trueview response length:", text.length);
+
   let data;
   try {
     data = JSON.parse(text);
   } catch {
+    console.log("Failed to parse trueview JSON");
     return [];
   }
 
@@ -111,7 +115,7 @@ function parsePrices(data, products) {
     const product = products.find((p) => p.id === id);
     const name = product?.name || id;
 
-    // Common structure: stores array
+    // Case: stores array
     if (Array.isArray(item.stores)) {
       for (const s of item.stores) {
         if (!s.price || !s.store) continue;
@@ -125,7 +129,7 @@ function parsePrices(data, products) {
       }
     }
 
-    // Flat keys fallback
+    // Case: flat keys (tesco_price, etc.)
     for (const [k, v] of Object.entries(item)) {
       if (k.endsWith("_price") && v) {
         const store = k.replace("_price", "");
@@ -143,8 +147,6 @@ function parsePrices(data, products) {
 }
 
 // ---------------------------------------------------------------------------
-// Price formatter
-// ---------------------------------------------------------------------------
 function formatPrice(p) {
   const num = parseFloat(String(p).replace(/[^\d.]/g, ""));
   if (isNaN(num)) return p;
@@ -152,39 +154,47 @@ function formatPrice(p) {
 }
 
 // ---------------------------------------------------------------------------
-// MAIN ROUTE
+// ROOT (so Railway doesn’t show 404)
+// ---------------------------------------------------------------------------
+app.get("/", (_, res) => {
+  res.send("API running. Use /search?q=milk");
+});
+
+// ---------------------------------------------------------------------------
+// MAIN SEARCH
 // ---------------------------------------------------------------------------
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q=" });
 
   try {
-    console.log(`Searching: ${query}`);
+    console.log("\n==============================");
+    console.log("Searching:", query);
 
-    // Step 1: fetch HTML
     const url = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`;
     const r = await safeFetch(url, { Referer: "https://www.trolley.co.uk/" });
 
     const html = await r.text();
 
-    // Step 2: extract products
+    console.log("HTML length:", html.length);
+
     const products = extractProducts(html);
 
     if (products.length === 0) {
+      console.log("No products found");
       return res.json({ query, results: [] });
     }
 
-    console.log(`Found IDs: ${products.map((p) => p.id).join(", ")}`);
-
-    // Step 3: fetch prices
     const results = await fetchPrices(products);
+
+    console.log("Final results:", results.length);
 
     res.json({ query, results });
   } catch (err) {
-    console.error(err);
+    console.error("ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ---------------------------------------------------------------------------
-app.listen(3000, () => console.log("Running on port 3000"));
+app.listen(PORT, () => console.log(`Running on port ${PORT}`));
