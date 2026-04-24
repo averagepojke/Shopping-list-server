@@ -548,11 +548,11 @@ app.get("/debug-autosuggest", async (req, res) => {
   });
   const text = await r.text();
 
-  // Also list all top-level variable names declared in the file
-  const varNames = [...text.matchAll(/^var\s+(\w+)\s*=/gm)].map(m => m[1]);
+  // List all variable names (handles leading whitespace)
+  const varOffsets = [...text.matchAll(/var\s+(\w+)\s*=/g)].map(m => `${m[1]}@${m.index}`);
 
   res.type("text/plain").send(
-    `// ${url}\n// status: ${r.status}\n// length: ${text.length}\n// vars: ${varNames.join(", ")}\n// showing chars ${from}–${from + len}\n\n` +
+    `// ${url}\n// status: ${r.status}\n// length: ${text.length}\n// vars: ${varOffsets.join(", ")}\n// showing chars ${from}–${from + len}\n\n` +
     text.slice(from, from + len)
   );
 });
