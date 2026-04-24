@@ -551,49 +551,21 @@ app.get("/search", async (req, res) => {
 
   console.log(`\nSearching: "${query}"`);
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.flushHeaders();
+  const settle = (promise, store) =>
+    promise
+      .then(r => { console.log(`  ✓ ${store}: ${r.length} result(s)`); return r; })
+      .catch(err => { console.warn(`  ✗ ${store}:`, err.message); return []; });
 
-  const sendResult = (storeName, results) => {
-    const data = JSON.stringify({ store: storeName, results });
-    res.write(`data: ${data}\n\n`);
-  };
+  const [sainsburys, tesco, asda, morrisons] = await Promise.all([
+    settle(searchSainsburys(query), "Sainsbury's"),
+    settle(searchTesco(query), "Tesco"),
+    settle(searchAsda(query), "ASDA"),
+    settle(searchMorrisons(query), "Morrisons"),
+  ]);
 
-  const sendDone = () => {
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  };
-
-  const stores = [
-    { name: "Sainsbury's", fn: searchSainsburys },
-    { name: "ASDA",        fn: searchAsda },
-    { name: "Tesco",       fn: searchTesco },
-    { name: "Morrisons",   fn: searchMorrisons },
-  ];
-
-  let completed = 0;
-
-  for (const store of stores) {
-    store.fn(query)
-      .then(results => {
-        console.log(`  ✓ ${store.name}: ${results.length} result(s)`);
-        if (results.length > 0) sendResult(store.name, results);
-      })
-      .catch(err => {
-        console.warn(`  ✗ ${store.name}:`, err.message);
-      })
-      .finally(() => {
-        completed++;
-        if (completed === stores.length) sendDone();
-      });
-  }
-
-  req.on("close", () => res.end());
+  const results = [...sainsburys, ...tesco, ...asda, ...morrisons];
+  res.json({ query, results });
 });
-
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
