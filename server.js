@@ -60,7 +60,8 @@ async function newPage() {
   const page = await ctx.newPage();
 
   await page.route("**/*", (route) => {
-    if (["image", "font", "media", "stylesheet"].includes(route.request().resourceType())) {
+    // Allow images now so we can grab product image URLs
+    if (["font", "media", "stylesheet"].includes(route.request().resourceType())) {
       route.abort();
     } else {
       route.continue();
@@ -71,9 +72,7 @@ async function newPage() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TROLLEY DOM SCRAPER
-// Each .product-item innerText looks like:
-//   "320g\nSainsbury's\nProduct Name\n368\n£3.75\n£1.17 per 100g"
+// TROLLEY DOM SCRAPER — now also extracts product image URLs
 // ─────────────────────────────────────────────────────────────────────────────
 async function scrapeTrolley(page) {
   return page.evaluate(() => {
@@ -147,7 +146,18 @@ async function scrapeTrolley(page) {
       }
 
       if (!productName) continue;
-      items.push({ name: productName.slice(0, 150), store, price, unit });
+
+      // Extract product image URL from the card's img tag
+      const img = card.querySelector("img");
+      const imageUrl = img ? (img.src || img.dataset.src || img.dataset.lazySrc || "") : "";
+
+      items.push({ 
+        name: productName.slice(0, 150), 
+        store, 
+        price, 
+        unit,
+        imageUrl: imageUrl || null,
+      });
     }
 
     // Deduplicate
@@ -161,12 +171,9 @@ async function scrapeTrolley(page) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SEARCH TROLLEY
-// Loads the page then clicks "More Results" up to (clicks) times.
-// Each click appends ~20 more products to the DOM.
-// Default clicks=4 gives ~100 products (1 initial load + 4 clicks).
+// SEARCH TROLLEY — now supports a callback for streaming results progressively
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchTrolley(query, clicks = 4) {
+async function searchTrolley(query, clicks = 4, onBatch = null) {
   const { page, ctx } = await newPage();
   try {
     await page.goto(
@@ -174,7 +181,6 @@ async function searchTrolley(query, clicks = 4) {
       { waitUntil: "domcontentloaded", timeout: 25000 }
     );
 
-    // Wait for first batch of products
     await Promise.race([
       page.waitForSelector(".product-item", { timeout: 10000 }),
       page.waitForTimeout(8000),
@@ -184,14 +190,34 @@ async function searchTrolley(query, clicks = 4) {
     const initialCount = await page.$$eval(".product-item", els => els.length);
     console.log(`  Trolley initial: ${initialCount} products`);
 
-    // Click "More Results" / "Show More" button repeatedly
-    // Trolley uses class search_more-results (seen in debug classes)
+    // Scrape & emit the initial batch immediately
+    const seen = new Set();
+    let allResults = [];
+
+    const emitBatch = async (isLast = false) => {
+      const current = await scrapeTrolley(page);
+      const newItems = current.filter(r => {
+        const key = `${r.name}|${r.store}|${r.price}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      allResults = [...allResults, ...newItems];
+      if (onBatch && newItems.length > 0) {
+        onBatch(newItems, allResults, isLast);
+      }
+      return newItems.length;
+    };
+
+    await emitBatch(clicks === 0);
+
     const MORE_BTN = ".search_more-results, [class*='more-results'], [class*='load-more'], [class*='show-more']";
 
     for (let i = 0; i < clicks; i++) {
       const btn = await page.$(MORE_BTN);
       if (!btn) {
         console.log(`  Trolley: no more-results button at click ${i + 1}, stopping`);
+        if (onBatch) onBatch([], allResults, true);
         break;
       }
 
@@ -200,7 +226,6 @@ async function searchTrolley(query, clicks = 4) {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
       await btn.click().catch(() => {});
 
-      // Wait for new products to appear (count increases)
       await page.waitForFunction(
         (prev, sel) => document.querySelectorAll(sel).length > prev,
         { timeout: 8000 },
@@ -213,17 +238,21 @@ async function searchTrolley(query, clicks = 4) {
       const newCount = await page.$$eval(".product-item", els => els.length);
       console.log(`  Trolley click ${i + 1}: ${newCount} products`);
 
+      const isLast = i === clicks - 1;
+      const added = await emitBatch(isLast);
+
       if (newCount === prevCount) {
         console.log(`  Trolley: no new products loaded, stopping`);
+        if (onBatch) onBatch([], allResults, true);
         break;
       }
     }
 
-    const results = await scrapeTrolley(page);
-    console.log(`  Trolley total: ${results.length}`);
-    return results;
+    console.log(`  Trolley total: ${allResults.length}`);
+    return allResults;
   } catch (err) {
     console.log(`  Trolley error: ${err.message}`);
+    if (onBatch) onBatch([], [], true);
     return [];
   } finally {
     await ctx.close().catch(() => {});
@@ -233,14 +262,40 @@ async function searchTrolley(query, clicks = 4) {
 // ─────────────────────────────────────────────────────────────────────────────
 // AGGREGATE
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchAll(query, clicks = 4) {
+async function searchAll(query, clicks = 4, onBatch = null) {
   console.log(`\nSearching: "${query}" (up to ${clicks} load-more clicks)`);
-  const results = await searchTrolley(query, clicks);
+  const results = await searchTrolley(query, clicks, onBatch);
   const byStore = {};
   for (const r of results) byStore[r.store] = (byStore[r.store] || 0) + 1;
   console.log("  By store:", JSON.stringify(byStore));
   return results;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPEN FOOD FACTS IMAGE LOOKUP
+// Returns a product image URL for a given query (best-effort)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/image", async (req, res) => {
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: "Missing ?q= param" });
+
+  try {
+    // Open Food Facts search — free, no key needed
+    const searchUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=5&fields=product_name,image_front_url,image_url`;
+    const response = await fetch(searchUrl, {
+      headers: { "User-Agent": "GroceryPriceApp/1.0 (contact@example.com)" },
+      signal: AbortSignal.timeout(6000),
+    });
+    const data = await response.json();
+    const products = (data.products || []).filter(p => p.image_front_url || p.image_url);
+    if (products.length === 0) return res.json({ imageUrl: null });
+    const imageUrl = products[0].image_front_url || products[0].image_url;
+    res.json({ imageUrl });
+  } catch (err) {
+    console.log("  Image lookup error:", err.message);
+    res.json({ imageUrl: null });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTES
@@ -249,11 +304,14 @@ app.get("/", (_, res) => {
   res.send(
     "Grocery price API\n" +
     "  GET  /search?q=milk[&clicks=4]\n" +
+    "  GET  /search/stream?q=milk[&clicks=4]   ← SSE streaming\n" +
     "  POST /compare  { items: ['milk','bread'], clicks: 4 }\n" +
+    "  GET  /image?q=semi-skimmed milk         ← product image URL\n" +
     "  GET  /debug?q=chicken"
   );
 });
 
+// ── Non-streaming search (original behaviour) ──────────────────────────────
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
@@ -264,6 +322,43 @@ app.get("/search", async (req, res) => {
   } catch (err) {
     console.error("ERROR /search:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── SSE streaming search — sends batches as they arrive ───────────────────
+// Client receives newline-delimited JSON events:
+//   data: {"type":"batch","items":[...],"total":20,"done":false}
+//   data: {"type":"batch","items":[...],"total":40,"done":true}
+app.get("/search/stream", async (req, res) => {
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: "Missing ?q= param" });
+  const clicks = Math.min(parseInt(req.query.clicks) || 4, 10);
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (obj) => {
+    res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    // flush if available (compression middleware etc.)
+    if (typeof res.flush === "function") res.flush();
+  };
+
+  try {
+    await searchAll(query, clicks, (newItems, allResults, done) => {
+      send({
+        type: "batch",
+        items: newItems,
+        total: allResults.length,
+        cheapest: findCheapest(allResults),
+        done,
+      });
+    });
+  } catch (err) {
+    send({ type: "error", message: err.message });
+  } finally {
+    res.end();
   }
 });
 
