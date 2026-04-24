@@ -116,7 +116,7 @@ function parseSainsburysProducts(json, query) {
       p.current_retail_price ?? p.prices?.price?.value ?? null;
 
     if (!name || priceRaw == null) continue;
-    if (!name.toLowerCase().includes(queryLower)) continue;
+    // Removed strict name filter — trust the API to return relevant results
 
     const unit = p.unit_price?.measure ?? p.retail_price?.measure ?? "";
     results.push({
@@ -143,11 +143,13 @@ async function searchSainsburysDirect(query) {
   for (const url of endpoints) {
     try {
       const res = await safeFetch(url, { headers: GOL_API_HEADERS }, 10000);
-      if (!res.ok) continue;
+      if (!res.ok) { console.log(`  [sainsburys] ${res.status} for ${new URL(url).searchParams.toString().slice(0, 60)}`); continue; }
       const json = await res.json();
       const results = parseSainsburysProducts(json, query);
+      const total = (json?.products ?? json?.data?.products ?? json?.results ?? json?.data ?? []).length;
+      console.log(`  [sainsburys] ${total} products returned, ${results.length} matched`);
       if (results.length > 0) return results;
-    } catch { /* try next */ }
+    } catch (e) { console.log(`  [sainsburys] error: ${e.message}`); }
   }
   return null;
 }
@@ -427,13 +429,23 @@ async function searchTesco(query) {
     }, 15000);
 
     if (!res.ok) {
+      console.log(`  [tesco] xapi ${res.status} — invalidating cache`);
       tescoXapiCache = null;
       return [];
     }
 
     const json = await res.json();
-    return parseTescoXapi(json);
-  } catch {
+    const results = parseTescoXapi(json);
+
+    // If empty results, the session token may have expired — invalidate so next call re-captures
+    if (results.length === 0) {
+      console.log("  [tesco] 0 results — invalidating cache for next search");
+      tescoXapiCache = null;
+    }
+
+    return results;
+  } catch (err) {
+    console.log(`  [tesco] error: ${err.message} — invalidating cache`);
     tescoXapiCache = null;
     return [];
   }
@@ -543,7 +555,7 @@ async function searchMorrisons(query) {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming search endpoint — results arrive store by store via SSE
+// Main search endpoint — plain JSON response
 // ---------------------------------------------------------------------------
 app.get("/search", async (req, res) => {
   const query = req.query.q;
@@ -556,16 +568,18 @@ app.get("/search", async (req, res) => {
       .then(r => { console.log(`  ✓ ${store}: ${r.length} result(s)`); return r; })
       .catch(err => { console.warn(`  ✗ ${store}:`, err.message); return []; });
 
-  const [sainsburys, tesco, asda, morrisons] = await Promise.all([
+  const [sainsburys, asda, tesco, morrisons] = await Promise.all([
     settle(searchSainsburys(query), "Sainsbury's"),
-    settle(searchTesco(query), "Tesco"),
     settle(searchAsda(query), "ASDA"),
+    settle(searchTesco(query), "Tesco"),
     settle(searchMorrisons(query), "Morrisons"),
   ]);
 
-  const results = [...sainsburys, ...tesco, ...asda, ...morrisons];
+  const results = [...sainsburys, ...asda, ...tesco, ...morrisons];
+  console.log(`  → ${results.length} total results`);
   res.json({ query, results });
 });
+
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
