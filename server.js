@@ -1,80 +1,19 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
-const cheerio = require("cheerio");
-const puppeteer = require("puppeteer");
 
 const app = express();
 app.use(cors());
 
-// ---------------------------------------------------------------------------
-// Shared browser-like headers
-// ---------------------------------------------------------------------------
-const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Accept-Language": "en-GB,en;q=0.9",
-  "Accept-Encoding": "identity",
-  Connection: "keep-alive",
-  "Upgrade-Insecure-Requests": "1",
-  "Cache-Control": "max-age=0",
-};
-
-const GOL_API_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept: "application/json",
-  "Accept-Language": "en-GB,en;q=0.9",
-  "X-Requested-With": "XMLHttpRequest",
-  Referer: "https://www.sainsburys.co.uk/",
-  Origin: "https://www.sainsburys.co.uk",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Referer": "https://www.trolley.co.uk/",
 };
 
 // ---------------------------------------------------------------------------
-// Puppeteer browser pool
-// ---------------------------------------------------------------------------
-let browserInstance = null;
-
-async function getBrowser() {
-  if (!browserInstance || !browserInstance.connected) {
-    browserInstance = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--window-size=1280,800",
-      ],
-    });
-  }
-  return browserInstance;
-}
-
-async function newPage() {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-  );
-  await page.setExtraHTTPHeaders({ "Accept-Language": "en-GB,en;q=0.9" });
-  await page.setViewport({ width: 1280, height: 800 });
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const type = req.resourceType();
-    if (["image", "font", "media"].includes(type)) req.abort();
-    else req.continue();
-  });
-  return page;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: safe fetch with timeout
+// Helper: fetch with timeout
 // ---------------------------------------------------------------------------
 async function safeFetch(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
@@ -87,475 +26,183 @@ async function safeFetch(url, options = {}, timeoutMs = 12000) {
 }
 
 // ---------------------------------------------------------------------------
-// Sainsbury's
+// Step 1: Search trolley.co.uk and extract product IDs from the HTML
+// Product IDs are 3 uppercase letters + 3 digits e.g. MOZ184, SOY634
 // ---------------------------------------------------------------------------
-const SAINSBURYS_BASE =
-  "https://www.sainsburys.co.uk/groceries-api/gol-services/product/v1/product";
-const SAINSBURYS_STORE = "2168";
+async function searchTrolley(query) {
+  const url = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}&filter_menus=1`;
 
-function parseSainsburysProducts(json, query) {
-  const candidates =
-    json?.products ??
-    json?.data?.products ??
-    json?.catalogue_products ??
-    json?.results ??
-    (Array.isArray(json?.data) ? json.data : null) ??
-    [];
+  const res = await safeFetch(url, { headers: HEADERS }, 12000);
+  if (!res.ok) throw new Error(`Trolley search HTTP ${res.status}`);
+  const html = await res.text();
 
-  const arr = Array.isArray(candidates) ? candidates : [];
-  const results = [];
-  const queryLower = query.toLowerCase();
+  // Extract product IDs — they appear in data attributes and JS arrays in the page
+  // Pattern: 3 uppercase letters followed by 3 digits
+  const idPattern = /\b([A-Z]{3}[0-9]{3})\b/g;
+  const allMatches = [...html.matchAll(idPattern)].map(m => m[1]);
 
-  for (const p of arr) {
-    if (results.length >= 3) break;
-    const name =
-      p.name ?? p.display_name ?? p.full_name ??
-      p.product_info?.name ?? p.base_product_info?.name ?? "";
-    const priceRaw =
-      p.retail_price?.price ?? p.price ?? p.unit_price?.price ??
-      p.current_retail_price ?? p.prices?.price?.value ?? null;
-
-    if (!name || priceRaw == null) continue;
-    // Removed strict name filter — trust the API to return relevant results
-
-    const unit = p.unit_price?.measure ?? p.retail_price?.measure ?? "";
-    results.push({
-      name: name.trim().slice(0, 120),
-      price: `£${Number(priceRaw).toFixed(2)}`,
-      unit,
-      store: "Sainsbury's",
-    });
+  // Deduplicate while preserving order
+  const seen = new Set();
+  const productIds = [];
+  for (const id of allMatches) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      productIds.push(id);
+    }
   }
+
+  console.log(`  [trolley search] found ${productIds.length} product IDs for "${query}"`);
+  return productIds.slice(0, 10); // take top 10 results
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Get prices for a list of product IDs via trueview.php
+// Returns store prices for each product
+// ---------------------------------------------------------------------------
+async function getTrueviewPrices(productIds) {
+  if (productIds.length === 0) return [];
+
+  // Build pipe-separated lists
+  const idParam = productIds.join("|");
+  const posParam = productIds.map((_, i) => i + 1).join("|");
+
+  const url =
+    `https://www.trolley.co.uk/_library/ajax/trueview.php` +
+    `?product_id=${encodeURIComponent(idParam)}&p=${encodeURIComponent(posParam)}&sid=`;
+
+  const res = await safeFetch(url, {
+    headers: {
+      ...HEADERS,
+      Accept: "application/json, text/javascript, */*",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+  }, 12000);
+
+  if (!res.ok) throw new Error(`Trueview HTTP ${res.status}`);
+
+  const text = await res.text();
+
+  // Try to parse as JSON
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.warn("  [trueview] non-JSON response, trying to extract prices from HTML");
+    return parseTrueviewHtml(text, productIds);
+  }
+
+  return parseTrueviewJson(data, productIds);
+}
+
+// ---------------------------------------------------------------------------
+// Parse trueview JSON response
+// Structure may vary — we look for price, store name, product name
+// ---------------------------------------------------------------------------
+function parseTrueviewJson(data, productIds) {
+  const results = [];
+
+  // Handle array of products
+  const items = Array.isArray(data) ? data : (data.products ?? data.results ?? data.items ?? Object.values(data));
+
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+
+    // Each item may contain multiple store prices
+    const stores = item.stores ?? item.prices ?? item.retailers ?? (Array.isArray(item) ? item : null);
+
+    const productName = item.name ?? item.title ?? item.product_name ?? "";
+
+    if (Array.isArray(stores)) {
+      for (const store of stores) {
+        const price = store.price ?? store.current_price ?? store.value;
+        const storeName = store.store ?? store.retailer ?? store.name ?? store.source ?? "";
+        if (price != null && storeName) {
+          results.push({
+            name: productName || storeName,
+            price: formatPrice(price),
+            unit: store.unit_price ?? store.per_unit ?? "",
+            store: storeName,
+          });
+        }
+      }
+    } else {
+      // Maybe flat structure: { name, tesco_price, asda_price, ... }
+      const storeKeys = ["tesco", "sainsburys", "asda", "morrisons", "ocado", "aldi", "lidl", "waitrose", "iceland", "coop"];
+      for (const key of storeKeys) {
+        const price = item[`${key}_price`] ?? item[key];
+        if (price != null && price !== "" && price !== "N/A") {
+          results.push({
+            name: productName,
+            price: formatPrice(price),
+            unit: item[`${key}_unit`] ?? "",
+            store: capitalise(key),
+          });
+        }
+      }
+    }
+  }
+
   return results;
 }
 
-async function searchSainsburysDirect(query) {
-  const q = encodeURIComponent(query);
-  const s = SAINSBURYS_STORE;
-  const endpoints = [
-    `${SAINSBURYS_BASE}?filter%5Bkeyword%5D=${q}&page_size=9&store=${s}`,
-    `${SAINSBURYS_BASE}?filter[keyword]=${q}&page_size=9&store=${s}`,
-    `${SAINSBURYS_BASE}?keywords=${q}&page_size=9&store=${s}`,
-    `${SAINSBURYS_BASE}?q=${q}&page_size=9&store=${s}`,
-    `https://www.sainsburys.co.uk/groceries-api/gol-services/product/v2/product?filter%5Bkeyword%5D=${q}&page_size=9&store=${s}`,
+// ---------------------------------------------------------------------------
+// Fallback: parse trueview HTML response for price data
+// Trolley sometimes returns an HTML snippet rather than JSON
+// ---------------------------------------------------------------------------
+function parseTrueviewHtml(html, productIds) {
+  const results = [];
+
+  // Look for price patterns like £1.50, 1.50, etc near store names
+  const storePatterns = [
+    { name: "Tesco", pattern: /tesco[^£]*£([\d.]+)/gi },
+    { name: "Sainsbury's", pattern: /sainsbury[^£]*£([\d.]+)/gi },
+    { name: "ASDA", pattern: /asda[^£]*£([\d.]+)/gi },
+    { name: "Morrisons", pattern: /morrison[^£]*£([\d.]+)/gi },
+    { name: "Ocado", pattern: /ocado[^£]*£([\d.]+)/gi },
+    { name: "Waitrose", pattern: /waitrose[^£]*£([\d.]+)/gi },
+    { name: "Iceland", pattern: /iceland[^£]*£([\d.]+)/gi },
+    { name: "Aldi", pattern: /aldi[^£]*£([\d.]+)/gi },
   ];
 
-  for (const url of endpoints) {
-    try {
-      const res = await safeFetch(url, { headers: GOL_API_HEADERS }, 10000);
-      if (!res.ok) { console.log(`  [sainsburys] ${res.status} for ${new URL(url).searchParams.toString().slice(0, 60)}`); continue; }
-      const json = await res.json();
-      const results = parseSainsburysProducts(json, query);
-      const total = (json?.products ?? json?.data?.products ?? json?.results ?? json?.data ?? []).length;
-      console.log(`  [sainsburys] ${total} products returned, ${results.length} matched`);
-      if (results.length > 0) return results;
-    } catch (e) { console.log(`  [sainsburys] error: ${e.message}`); }
-  }
-  return null;
-}
+  // Also try to get product name from HTML title tags
+  const nameMatch = html.match(/<(?:h[1-3]|strong|b)[^>]*>([^<]{3,80})<\/(?:h[1-3]|strong|b)>/i);
+  const productName = nameMatch ? nameMatch[1].trim() : "";
 
-async function searchSainsburysPuppeteer(query) {
-  const page = await newPage();
-  const results = [];
-
-  return new Promise(async (resolve) => {
-    const timeout = setTimeout(() => {
-      page.close().catch(() => {});
-      resolve([]);
-    }, 30000);
-
-    page.on("response", async (response) => {
-      if (results.length >= 3) return;
-      const url = response.url();
-      if (!url.includes("groceries-api/gol-services/product")) return;
-      const ct = response.headers()["content-type"] || "";
-      if (!ct.includes("json")) return;
-      try {
-        const json = await response.json();
-        const parsed = parseSainsburysProducts(json, query);
-        results.push(...parsed.slice(0, 3 - results.length));
-        if (results.length >= 1) {
-          clearTimeout(timeout);
-          await page.close().catch(() => {});
-          resolve(results);
-        }
-      } catch { /* skip */ }
-    });
-
-    try {
-      await page.goto(
-        `https://www.sainsburys.co.uk/gol-ui/SearchDisplay?searchTerm=${encodeURIComponent(query)}&pageSize=9`,
-        { waitUntil: "domcontentloaded", timeout: 25000 }
-      );
-    } catch {
-      clearTimeout(timeout);
-      await page.close().catch(() => {});
-      resolve([]);
-    }
-  });
-}
-
-async function searchSainsburys(query) {
-  const direct = await searchSainsburysDirect(query);
-  if (direct !== null) return direct;
-  return searchSainsburysPuppeteer(query);
-}
-
-// ---------------------------------------------------------------------------
-// ASDA — Algolia
-// ---------------------------------------------------------------------------
-let asdaAlgoliaCache = null;
-
-async function getAsdaAlgoliaCredentials() {
-  if (asdaAlgoliaCache) return asdaAlgoliaCache;
-
-  const page = await newPage();
-
-  return new Promise(async (resolve) => {
-    const timeout = setTimeout(async () => {
-      await page.close().catch(() => {});
-      resolve(null);
-    }, 25000);
-
-    page.removeAllListeners("request");
-    await page.setRequestInterception(true);
-
-    page.on("request", (req) => {
-      const url = req.url();
-      const type = req.resourceType();
-      if (["image", "font", "media"].includes(type)) { req.abort(); return; }
-
-      if (url.includes("algolia.net") && url.includes("/queries") && !asdaAlgoliaCache) {
-        const headers = req.headers();
-        const apiKey = headers["x-algolia-api-key"];
-        const appId  = headers["x-algolia-application-id"];
-        let indexName = null;
-        try {
-          const body = req.postData();
-          if (body) {
-            const parsed = JSON.parse(body);
-            indexName = parsed?.requests?.[0]?.indexName ?? null;
-          }
-        } catch { /* ignore */ }
-
-        if (apiKey && appId) {
-          asdaAlgoliaCache = { apiKey, appId, indexName };
-          clearTimeout(timeout);
-          req.continue();
-          page.close().catch(() => {});
-          resolve(asdaAlgoliaCache);
-          return;
-        }
-      }
-      req.continue();
-    });
-
-    try {
-      await page.goto("https://groceries.asda.com/search/milk", { waitUntil: "domcontentloaded", timeout: 20000 });
-      await new Promise(r => setTimeout(r, 8000));
-    } catch { /* ignore */ }
-
-    if (!asdaAlgoliaCache) {
-      clearTimeout(timeout);
-      await page.close().catch(() => {});
-      resolve(null);
-    }
-  });
-}
-
-async function algoliaSearch(appId, apiKey, indexName, query) {
-  const body = JSON.stringify({
-    requests: [{
-      indexName,
-      params: new URLSearchParams({
-        query,
-        hitsPerPage: "5",
-        filters: "STATUS:A",
-        attributesToRetrieve: "NAME,PRICES,BRAND",
-        attributesToHighlight: "",
-      }).toString(),
-    }],
-  });
-
-  const url =
-    `https://${appId.toLowerCase()}-dsn.algolia.net/1/indexes/*/queries` +
-    `?x-algolia-agent=Algolia%20for%20JavaScript%20(4.25.2)%3B%20Browser`;
-
-  const res = await safeFetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-algolia-application-id": appId,
-      "x-algolia-api-key": apiKey,
-    },
-    body,
-  });
-
-  if (!res.ok) throw new Error(`Algolia HTTP ${res.status}`);
-  return res.json();
-}
-
-function hitsToAsda(hits) {
-  return hits.slice(0, 3).map((h) => ({
-    name: (h.NAME ?? "Unknown").trim().slice(0, 120),
-    price: h.PRICES?.EN?.PRICE != null
-      ? `£${Number(h.PRICES.EN.PRICE).toFixed(2)}`
-      : "N/A",
-    unit: h.PRICES?.EN?.PRICEPERUOMFORMATTED ?? "",
-    store: "ASDA",
-  }));
-}
-
-async function searchAsda(query) {
-  const creds = await getAsdaAlgoliaCredentials();
-  if (!creds) return [];
-  const indexName = creds.indexName ?? "prod_main";
-  try {
-    const json = await algoliaSearch(creds.appId, creds.apiKey, indexName, query);
-    return hitsToAsda(json?.results?.[0]?.hits ?? []);
-  } catch {
-    asdaAlgoliaCache = null;
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tesco — xapi GraphQL via Puppeteer then replay
-// ---------------------------------------------------------------------------
-let tescoXapiCache = null;
-
-async function getTescoXapiTemplate() {
-  if (tescoXapiCache) return tescoXapiCache;
-
-  const page = await newPage();
-
-  return new Promise(async (resolve) => {
-    const timeout = setTimeout(async () => {
-      await page.close().catch(() => {});
-      resolve(null);
-    }, 40000);
-
-    page.removeAllListeners("request");
-    await page.setRequestInterception(true);
-
-    page.on("request", (req) => {
-      const url = req.url();
-      const type = req.resourceType();
-      if (["image", "font", "media"].includes(type)) { req.abort(); return; }
-
-      if (url.includes("xapi.tesco.com") && req.method() === "POST" && !tescoXapiCache) {
-        const headers = req.headers();
-        let body = null;
-        try { body = JSON.parse(req.postData() || "null"); } catch { /* ok */ }
-
-        const hasSearch = Array.isArray(body)
-          ? body.some(op => op?.operationName?.toLowerCase().includes("search") || op?.operationName?.toLowerCase().includes("product"))
-          : body?.operationName?.toLowerCase().includes("search") || body?.operationName?.toLowerCase().includes("product");
-
-        if (body && (hasSearch || Array.isArray(body))) {
-          tescoXapiCache = { url, headers, body };
-          clearTimeout(timeout);
-          req.continue();
-          page.close().catch(() => {});
-          resolve(tescoXapiCache);
-          return;
-        }
-      }
-      req.continue();
-    });
-
-    try {
-      await page.goto(
-        "https://www.tesco.com/groceries/en-GB/search?query=milk&count=24",
-        { waitUntil: "domcontentloaded", timeout: 30000 }
-      );
-      await new Promise(r => setTimeout(r, 15000));
-    } catch { /* ignore */ }
-
-    if (!tescoXapiCache) {
-      clearTimeout(timeout);
-      await page.close().catch(() => {});
-      resolve(null);
-    }
-  });
-}
-
-function parseTescoXapi(json) {
-  const results = [];
-  const ops = Array.isArray(json) ? json : [json];
-  for (const op of ops) {
-    if (results.length >= 3) break;
-    const items =
-      op?.data?.productsSearch?.productItems ??
-      op?.data?.productsByCategory?.productItems ??
-      op?.data?.recommendations?.productItems ??
-      [];
-    for (const item of items) {
-      if (results.length >= 3) break;
-      const p = item?.product ?? item;
-      const name = p?.name ?? p?.title ?? "";
-      const price =
-        p?.price?.actual ?? p?.price?.current ?? p?.price?.value ?? p?.unitPrice ?? null;
-      if (!name || price == null) continue;
+  for (const { name, pattern } of storePatterns) {
+    const match = pattern.exec(html);
+    if (match) {
       results.push({
-        name: String(name).trim().slice(0, 120),
-        price: `£${Number(price).toFixed(2)}`,
-        unit: p?.price?.unitOfMeasure ?? "",
-        store: "Tesco",
+        name: productName,
+        price: `£${parseFloat(match[1]).toFixed(2)}`,
+        unit: "",
+        store: name,
       });
     }
   }
+
   return results;
 }
 
-function patchTescoBody(body, query) {
-  const str = JSON.stringify(body);
-  const patched = str.replace(/"query"\s*:\s*"[^"]*"/g, `"query":"${query.replace(/"/g, '\\"')}"`);
-  return JSON.parse(patched);
-}
-
-async function searchTesco(query) {
-  const template = await getTescoXapiTemplate();
-  if (!template) return [];
-
-  try {
-    const patchedBody = patchTescoBody(template.body, query);
-    const { host, "content-length": _cl, ...safeHeaders } = template.headers;
-
-    const res = await safeFetch(template.url, {
-      method: "POST",
-      headers: { ...safeHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify(patchedBody),
-    }, 15000);
-
-    if (!res.ok) {
-      console.log(`  [tesco] xapi ${res.status} — invalidating cache`);
-      tescoXapiCache = null;
-      return [];
-    }
-
-    const json = await res.json();
-    const results = parseTescoXapi(json);
-
-    // If empty results, the session token may have expired — invalidate so next call re-captures
-    if (results.length === 0) {
-      console.log("  [tesco] 0 results — invalidating cache for next search");
-      tescoXapiCache = null;
-    }
-
-    return results;
-  } catch (err) {
-    console.log(`  [tesco] error: ${err.message} — invalidating cache`);
-    tescoXapiCache = null;
-    return [];
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function formatPrice(price) {
+  const num = parseFloat(String(price).replace(/[^0-9.]/g, ""));
+  if (isNaN(num)) return String(price);
+  // Trolley sometimes stores prices in pence (integers > 20 without decimal)
+  // Heuristic: if value > 20 and no decimal point in original, treat as pence
+  if (num > 20 && !String(price).includes(".") && num === Math.floor(num)) {
+    return `£${(num / 100).toFixed(2)}`;
   }
+  return `£${num.toFixed(2)}`;
+}
+
+function capitalise(str) {
+  return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
 }
 
 // ---------------------------------------------------------------------------
-// Morrisons
-// ---------------------------------------------------------------------------
-async function searchMorrisons(query) {
-  const page = await newPage();
-  const results = [];
-
-  return new Promise(async (resolve) => {
-    const timeout = setTimeout(() => {
-      page.close().catch(() => {});
-      resolve([]);
-    }, 60000);
-
-    page.removeAllListeners("request");
-    await page.setRequestInterception(true);
-
-    let sessionReady = false;
-
-    page.on("request", async (req) => {
-      const url = req.url();
-      const type = req.resourceType();
-      if (["image", "font", "media", "stylesheet"].includes(type)) { req.abort(); return; }
-
-      if (
-        sessionReady &&
-        url.includes("groceries.morrisons.com/api/search") &&
-        (url.includes("searchTerm=") || url.includes("entry=")) &&
-        !url.includes("suggestions") &&
-        !url.includes("redirects")
-      ) {
-        const newUrl = url
-          .replace(/searchTerm=[^&]*/i, `searchTerm=${encodeURIComponent(query)}`)
-          .replace(/entry=[^&]*/i, `entry=${encodeURIComponent(query)}`);
-
-        const cookies = await page.cookies();
-        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join("; ");
-
-        try {
-          const res = await safeFetch(newUrl, {
-            headers: {
-              ...BROWSER_HEADERS,
-              Accept: "application/json",
-              Referer: "https://groceries.morrisons.com/",
-              Cookie: cookieStr,
-            },
-          }, 12000);
-
-          const json = await res.json();
-          const items =
-            json?.products ?? json?.data?.products ?? json?.items ??
-            json?.results ?? json?.hits ?? json?.productItems ??
-            (Array.isArray(json) ? json : []);
-
-          for (const p of Array.isArray(items) ? items : []) {
-            if (results.length >= 3) break;
-            const name = p.name ?? p.title ?? p.displayName ?? p.product?.name ?? "";
-            const price =
-              p.price?.current ?? p.price?.value ?? p.pricePerItem ??
-              p.retailPrice ?? (typeof p.price === "number" ? p.price : null);
-            if (!name || price == null) continue;
-            results.push({
-              name: String(name).trim().slice(0, 120),
-              price: `£${Number(price).toFixed(2)}`,
-              unit: p.price?.perUnit ?? p.unitPrice ?? "",
-              store: "Morrisons",
-            });
-          }
-        } catch { /* ignore */ }
-
-        clearTimeout(timeout);
-        await page.close().catch(() => {});
-        resolve(results);
-        req.abort();
-        return;
-      }
-
-      req.continue();
-    });
-
-    try {
-      await page.goto("https://groceries.morrisons.com/", { waitUntil: "domcontentloaded", timeout: 20000 });
-      await new Promise(r => setTimeout(r, 3000));
-      sessionReady = true;
-
-      await page.goto(
-        `https://groceries.morrisons.com/search?entry=${encodeURIComponent(query)}`,
-        { waitUntil: "domcontentloaded", timeout: 20000 }
-      );
-      await new Promise(r => setTimeout(r, 15000));
-
-      if (results.length === 0) {
-        clearTimeout(timeout);
-        await page.close().catch(() => {});
-        resolve([]);
-      }
-    } catch {
-      clearTimeout(timeout);
-      await page.close().catch(() => {});
-      resolve([]);
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Main search endpoint — plain JSON response
+// GET /search?q=milk
 // ---------------------------------------------------------------------------
 app.get("/search", async (req, res) => {
   const query = req.query.q;
@@ -563,49 +210,30 @@ app.get("/search", async (req, res) => {
 
   console.log(`\nSearching: "${query}"`);
 
-  const settle = (promise, store) =>
-    promise
-      .then(r => { console.log(`  ✓ ${store}: ${r.length} result(s)`); return r; })
-      .catch(err => { console.warn(`  ✗ ${store}:`, err.message); return []; });
-
-  const [sainsburys, asda, tesco, morrisons] = await Promise.all([
-    settle(searchSainsburys(query), "Sainsbury's"),
-    settle(searchAsda(query), "ASDA"),
-    settle(searchTesco(query), "Tesco"),
-    settle(searchMorrisons(query), "Morrisons"),
-  ]);
-
-  const results = [...sainsburys, ...asda, ...tesco, ...morrisons];
-  console.log(`  → ${results.length} total results`);
-  res.json({ query, results });
-});
-
-// ---------------------------------------------------------------------------
-// Startup
-// ---------------------------------------------------------------------------
-app.listen(3000, async () => {
-  console.log("Running on port 3000");
   try {
-    await getBrowser();
-    console.log("[puppeteer] Browser ready");
+    // Step 1: get product IDs from search page
+    const productIds = await searchTrolley(query);
+    if (productIds.length === 0) {
+      return res.json({ query, results: [] });
+    }
 
-    Promise.all([
-      getAsdaAlgoliaCredentials().then(c => {
-        if (c) console.log(`[asda] credentials ready (app: ${c.appId}, index: ${c.indexName})`);
-        else console.warn("[asda] credential warm-up failed");
-      }),
-      getTescoXapiTemplate().then(t => {
-        if (t) console.log(`[tesco] xapi template ready: ${t.url.slice(0, 60)}`);
-        else console.warn("[tesco] xapi template warm-up failed");
-      }),
-    ]);
+    // Step 2: get prices for those products
+    const results = await getTrueviewPrices(productIds);
+    console.log(`  → ${results.length} store prices returned`);
+
+    res.json({ query, results });
   } catch (err) {
-    console.warn("[puppeteer] Could not pre-launch:", err.message);
+    console.error(`  Error: ${err.message}`);
+    res.status(502).json({ error: err.message });
   }
 });
 
-process.on("exit", () => { if (browserInstance) browserInstance.close(); });
-process.on("SIGINT", async () => {
-  if (browserInstance) await browserInstance.close();
-  process.exit(0);
-});
+// ---------------------------------------------------------------------------
+// GET /health
+// ---------------------------------------------------------------------------
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+app.listen(3000, () => console.log("Running on port 3000"));
