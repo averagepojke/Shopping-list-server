@@ -34,13 +34,26 @@ async function safeFetch(url, headers = {}, timeout = 15000) {
 }
 
 // ---------------------------------------------------------------------------
-// Extract product IDs (robust)
+// STEP 0: Get session cookies (IMPORTANT)
+// ---------------------------------------------------------------------------
+async function getCookies() {
+  const res = await safeFetch("https://www.trolley.co.uk/");
+  const cookies = res.headers.raw()["set-cookie"] || [];
+
+  const cookieStr = cookies.map(c => c.split(";")[0]).join("; ");
+
+  console.log("Cookies:", cookieStr || "(none)");
+
+  return cookieStr;
+}
+
+// ---------------------------------------------------------------------------
+// Extract product IDs
 // ---------------------------------------------------------------------------
 function extractProducts(html) {
   const seen = new Set();
   const products = [];
 
-  // From /product/.../ID
   for (const m of html.matchAll(/\/product\/[^/]+\/([A-Z0-9]{5,})/g)) {
     const id = m[1];
     if (!seen.has(id)) {
@@ -49,7 +62,6 @@ function extractProducts(html) {
     }
   }
 
-  // From data-id="ID"
   for (const m of html.matchAll(/data-id="([A-Z0-9]{5,})"/g)) {
     const id = m[1];
     if (!seen.has(id)) {
@@ -64,43 +76,41 @@ function extractProducts(html) {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch prices from trueview
+// Fetch prices
 // ---------------------------------------------------------------------------
-async function fetchPrices(products) {
+async function fetchPrices(products, cookieStr) {
   if (products.length === 0) return [];
 
-  const ids = products.map((p) => p.id);
+  const ids = products.map(p => p.id);
   const pos = ids.map((_, i) => i + 1);
 
   const url =
     `https://www.trolley.co.uk/_library/ajax/trueview.php` +
     `?product_id=${ids.join("|")}&p=${pos.join("|")}&sid=`;
 
-  console.log("Fetching prices for:", ids.join(", "));
+  console.log("Calling trueview:", url);
 
   const res = await safeFetch(url, {
     Accept: "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
     Referer: "https://www.trolley.co.uk/search/",
+    Cookie: cookieStr,
   });
 
   const text = await res.text();
 
-  console.log("trueview response length:", text.length);
+  console.log("trueview length:", text.length);
+  console.log("trueview preview:", text.slice(0, 300));
 
-  let data;
   try {
-    data = JSON.parse(text);
+    const data = JSON.parse(text);
+    return parsePrices(data, products);
   } catch {
-    console.log("Failed to parse trueview JSON");
+    console.log("❌ trueview NOT JSON");
     return [];
   }
-
-  return parsePrices(data, products);
 }
 
-// ---------------------------------------------------------------------------
-// Parse trueview JSON
 // ---------------------------------------------------------------------------
 function parsePrices(data, products) {
   const results = [];
@@ -112,10 +122,9 @@ function parsePrices(data, products) {
   for (const [id, item] of items) {
     if (!item || typeof item !== "object") continue;
 
-    const product = products.find((p) => p.id === id);
+    const product = products.find(p => p.id === id);
     const name = product?.name || id;
 
-    // Case: stores array
     if (Array.isArray(item.stores)) {
       for (const s of item.stores) {
         if (!s.price || !s.store) continue;
@@ -123,21 +132,8 @@ function parsePrices(data, products) {
         results.push({
           name,
           store: s.store,
-          price: formatPrice(s.price),
+          price: `£${parseFloat(s.price).toFixed(2)}`,
           unit: s.unit_price || "",
-        });
-      }
-    }
-
-    // Case: flat keys (tesco_price, etc.)
-    for (const [k, v] of Object.entries(item)) {
-      if (k.endsWith("_price") && v) {
-        const store = k.replace("_price", "");
-        results.push({
-          name,
-          store,
-          price: formatPrice(v),
-          unit: item[`${store}_unit`] || "",
         });
       }
     }
@@ -147,45 +143,40 @@ function parsePrices(data, products) {
 }
 
 // ---------------------------------------------------------------------------
-function formatPrice(p) {
-  const num = parseFloat(String(p).replace(/[^\d.]/g, ""));
-  if (isNaN(num)) return p;
-  return `£${num.toFixed(2)}`;
-}
-
-// ---------------------------------------------------------------------------
-// ROOT (so Railway doesn’t show 404)
-// ---------------------------------------------------------------------------
 app.get("/", (_, res) => {
-  res.send("API running. Use /search?q=milk");
+  res.send("Use /search?q=milk");
 });
 
-// ---------------------------------------------------------------------------
-// MAIN SEARCH
 // ---------------------------------------------------------------------------
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q=" });
 
   try {
-    console.log("\n==============================");
+    console.log("\n========================");
     console.log("Searching:", query);
 
+    const cookieStr = await getCookies();
+
     const url = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`;
-    const r = await safeFetch(url, { Referer: "https://www.trolley.co.uk/" });
+    const r = await safeFetch(url, {
+      Referer: "https://www.trolley.co.uk/",
+      Cookie: cookieStr,
+    });
 
     const html = await r.text();
 
     console.log("HTML length:", html.length);
+    console.log("HTML preview:", html.slice(0, 300));
 
     const products = extractProducts(html);
 
     if (products.length === 0) {
-      console.log("No products found");
+      console.log("❌ NO PRODUCTS FOUND");
       return res.json({ query, results: [] });
     }
 
-    const results = await fetchPrices(products);
+    const results = await fetchPrices(products, cookieStr);
 
     console.log("Final results:", results.length);
 
@@ -197,4 +188,4 @@ app.get("/search", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Running on ${PORT}`));
