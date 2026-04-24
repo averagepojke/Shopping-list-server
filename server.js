@@ -30,325 +30,348 @@ function findCheapest(results) {
     : null;
 }
 
-const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KHTML, like Gecko Chrome/124.0.0.0 Safari/537.36";
-
-async function safeFetch(url, opts = {}, timeoutMs = 20000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// SAINSBURY'S
+// BROWSER — single shared Playwright instance
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchSainsburys(query) {
-  // Try their internal API first
-  const apiUrl =
-    `https://www.sainsburys.co.uk/gol-ui/api/products` +
-    `?filter%5Bkeyword%5D=${encodeURIComponent(query)}&page_number=1&page_size=10&sortBy=RELEVANCE`;
-
-  try {
-    const res = await safeFetch(apiUrl, {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        Accept: "application/json",
-        "Accept-Language": "en-GB,en;q=0.9",
-        Referer: "https://www.sainsburys.co.uk/",
-        "X-Requested-With": "XMLHttpRequest",
-      },
-    });
-
-    if (res.ok) {
-      const json = await res.json();
-      const products =
-        json?.products ??
-        json?.data?.products ??
-        json?.catalogue_products ??
-        [];
-
-      const mapped = products
-        .map((p) => {
-          const price =
-            p?.retail_price?.price ??
-            p?.price ??
-            p?.pricing?.nowPrice ??
-            p?.unitPrice;
-          const unit = p?.unit_price?.measure
-            ? `${formatPrice(p.unit_price.price)}/${p.unit_price.measure}`
-            : "";
-          return {
-            name: p.name || p.full_name || query,
-            store: "Sainsbury's",
-            price: formatPrice(price),
-            unit,
-          };
-        })
-        .filter((r) => r.price != null);
-
-      if (mapped.length) {
-        console.log(`  Sainsbury's API: ${mapped.length}`);
-        return mapped;
-      }
-    } else {
-      console.log(`  Sainsbury's API HTTP ${res.status}`);
-    }
-  } catch (err) {
-    console.log(`  Sainsbury's API error: ${err.message}`);
-  }
-
-  // Fallback: scrape the search page __NEXT_DATA__
-  return searchSainsburysScrape(query);
-}
-
-async function searchSainsburysScrape(query) {
-  try {
-    const res = await safeFetch(
-      `https://www.sainsburys.co.uk/gol-ui/SearchResults/${encodeURIComponent(query)}`,
-      {
-        headers: {
-          "User-Agent": BROWSER_UA,
-          Accept: "text/html,application/xhtml+xml",
-          "Accept-Language": "en-GB,en;q=0.9",
-        },
-      }
-    );
-    const html = await res.text();
-    console.log(`  Sainsbury's scrape HTML length: ${html.length}`);
-
-    const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (!m) return [];
-
-    const data = JSON.parse(m[1]);
-    const results = [];
-
-    const walk = (obj, depth = 0) => {
-      if (!obj || typeof obj !== "object" || depth > 15) return;
-      if (Array.isArray(obj)) {
-        for (const item of obj) {
-          if (item?.name && item?.retail_price?.price != null) {
-            results.push({
-              name: item.name,
-              store: "Sainsbury's",
-              price: formatPrice(item.retail_price.price),
-              unit: item.unit_price?.measure
-                ? `${formatPrice(item.unit_price.price)}/${item.unit_price.measure}`
-                : "",
-            });
-          } else {
-            walk(item, depth + 1);
-          }
-        }
-      } else {
-        for (const val of Object.values(obj)) walk(val, depth + 1);
-      }
-    };
-    walk(data);
-    console.log(`  Sainsbury's scrape: ${results.length}`);
-    return results.filter((r) => r.price != null);
-  } catch (err) {
-    console.log(`  Sainsbury's scrape error: ${err.message}`);
-    return [];
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TESCO — their public product search API
-// ─────────────────────────────────────────────────────────────────────────────
-async function searchTesco(query) {
-  try {
-    const url = `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}&count=10`;
-    const res = await safeFetch(url, {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-GB,en;q=0.9",
-      },
-    });
-    const html = await res.text();
-
-    // Tesco embeds product data in __NEXT_DATA__
-    const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (!m) {
-      console.log("  Tesco: no __NEXT_DATA__");
-      return [];
-    }
-
-    const data = JSON.parse(m[1]);
-    const results = [];
-
-    const walk = (obj, depth = 0) => {
-      if (!obj || typeof obj !== "object" || depth > 15) return;
-      if (Array.isArray(obj)) {
-        for (const item of obj) {
-          // Tesco product shape: { title, price: { actual, unitPrice } }
-          if (item?.title && item?.price?.actual != null) {
-            results.push({
-              name: item.title,
-              store: "Tesco",
-              price: formatPrice(item.price.actual),
-              unit: item.price.unitPrice
-                ? `${formatPrice(item.price.unitPrice)}/${item.price.unitOfMeasure || "unit"}`
-                : "",
-            });
-          } else {
-            walk(item, depth + 1);
-          }
-        }
-      } else {
-        for (const val of Object.values(obj)) walk(val, depth + 1);
-      }
-    };
-    walk(data);
-    console.log(`  Tesco: ${results.length}`);
-    return results.filter((r) => r.price != null);
-  } catch (err) {
-    console.log(`  Tesco error: ${err.message}`);
-    return [];
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TROLLEY.CO.UK via Playwright
-// Playwright installs its own Chromium with all needed system libs.
-// ─────────────────────────────────────────────────────────────────────────────
-let playwrightBrowser = null;
+let _browser = null;
 
 async function getBrowser() {
-  if (playwrightBrowser) return playwrightBrowser;
+  if (_browser) return _browser;
   const { chromium } = require("playwright");
-  playwrightBrowser = await chromium.launch({
+  _browser = await chromium.launch({
     headless: true,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--disable-blink-features=AutomationControlled",
     ],
   });
-  console.log("  Playwright browser launched");
-  return playwrightBrowser;
+  console.log("Playwright browser ready");
+  return _browser;
+}
+
+async function newPage() {
+  const browser = await getBrowser();
+  const ctx = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KHTML, like Gecko Chrome/124.0.0.0 Safari/537.36",
+    locale: "en-GB",
+    extraHTTPHeaders: { "Accept-Language": "en-GB,en;q=0.9" },
+    viewport: { width: 1280, height: 800 },
+  });
+  const page = await ctx.newPage();
+
+  // Block images/fonts/media to speed up page loads
+  await page.route("**/*", (route) => {
+    if (["image", "font", "media", "stylesheet"].includes(route.request().resourceType())) {
+      route.abort();
+    } else {
+      route.continue();
+    }
+  });
+
+  return { page, ctx };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXTRACT PRICES from __NEXT_DATA__ — shared by Tesco, Sainsbury's, Trolley
+// ─────────────────────────────────────────────────────────────────────────────
+function extractNextData(json, storeName) {
+  const results = [];
+
+  const walk = (obj, depth = 0) => {
+    if (!obj || typeof obj !== "object" || depth > 15) return;
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        if (item && typeof item === "object") {
+          // Sainsbury's shape
+          if (item.retail_price?.price != null && item.name) {
+            results.push({
+              name: item.name,
+              store: storeName || "Sainsbury's",
+              price: formatPrice(item.retail_price.price),
+              unit: item.unit_price?.measure
+                ? `${formatPrice(item.unit_price.price)}/${item.unit_price.measure}`
+                : "",
+            });
+          }
+          // Tesco shape
+          else if (item.price?.actual != null && (item.title || item.name)) {
+            results.push({
+              name: item.title || item.name,
+              store: storeName || "Tesco",
+              price: formatPrice(item.price.actual),
+              unit: item.price.unitPrice
+                ? `${formatPrice(item.price.unitPrice)}/${item.price.unitOfMeasure || "unit"}`
+                : "",
+            });
+          }
+          // Trolley shape — item has supermarkets array
+          else if (item.name && Array.isArray(item.supermarkets)) {
+            for (const s of item.supermarkets) {
+              if (s.price != null && s.name) {
+                results.push({
+                  name: item.name,
+                  store: s.name,
+                  price: formatPrice(s.price),
+                  unit: s.unitPrice ? formatPrice(s.unitPrice) : "",
+                });
+              }
+            }
+          }
+          // Trolley shape — item has prices object
+          else if (item.name && item.prices && typeof item.prices === "object") {
+            for (const [store, price] of Object.entries(item.prices)) {
+              if (price != null) {
+                results.push({
+                  name: item.name,
+                  store,
+                  price: formatPrice(price),
+                  unit: "",
+                });
+              }
+            }
+          }
+          else {
+            walk(item, depth + 1);
+          }
+        }
+      }
+    } else {
+      for (const val of Object.values(obj)) walk(val, depth + 1);
+    }
+  };
+
+  walk(json);
+  return results.filter((r) => r.price != null);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERCEPT API RESPONSES — catches XHR/fetch calls the page makes
+// This is the most reliable approach: let the real browser make the real
+// requests, intercept the JSON responses as they arrive.
+// ─────────────────────────────────────────────────────────────────────────────
+async function scrapeWithIntercept(url, store, apiPatterns, waitSelector, timeout = 25000) {
+  const { page, ctx } = await newPage();
+  const intercepted = [];
+
+  try {
+    // Intercept API responses matching our patterns
+    page.on("response", async (response) => {
+      const respUrl = response.url();
+      if (apiPatterns.some((p) => respUrl.includes(p))) {
+        try {
+          const json = await response.json();
+          intercepted.push(json);
+          console.log(`  [intercept] ${store}: got response from ${respUrl.split("?")[0]}`);
+        } catch (_) {}
+      }
+    });
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+
+    // Wait for a product/price element to appear
+    if (waitSelector) {
+      await page.waitForSelector(waitSelector, { timeout: 12000 }).catch(() => {});
+    } else {
+      await page.waitForTimeout(4000);
+    }
+
+    // Also try __NEXT_DATA__
+    const nextDataText = await page
+      .evaluate(() => document.getElementById("__NEXT_DATA__")?.textContent)
+      .catch(() => null);
+
+    let results = [];
+
+    // Parse intercepted API responses first
+    for (const json of intercepted) {
+      const r = parseStoreJson(json, store);
+      results.push(...r);
+    }
+
+    // Fall back to __NEXT_DATA__
+    if (!results.length && nextDataText) {
+      try {
+        const nd = JSON.parse(nextDataText);
+        results = extractNextData(nd, store);
+        console.log(`  [nextdata] ${store}: ${results.length}`);
+      } catch (_) {}
+    }
+
+    // Last resort: scrape visible price text from DOM
+    if (!results.length) {
+      results = await scrapePricesFromDom(page, store);
+      console.log(`  [dom] ${store}: ${results.length}`);
+    }
+
+    return results;
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARSE STORE-SPECIFIC JSON RESPONSES
+// ─────────────────────────────────────────────────────────────────────────────
+function parseStoreJson(json, store) {
+  const results = [];
+
+  // Sainsbury's API response shape
+  const sProducts =
+    json?.products ??
+    json?.data?.products ??
+    json?.catalogue_products ??
+    [];
+  if (sProducts.length) {
+    for (const p of sProducts) {
+      const price = p?.retail_price?.price ?? p?.price ?? p?.pricing?.nowPrice;
+      if (price == null || !p.name) continue;
+      results.push({
+        name: p.name,
+        store: "Sainsbury's",
+        price: formatPrice(price),
+        unit: p.unit_price?.measure
+          ? `${formatPrice(p.unit_price.price)}/${p.unit_price.measure}`
+          : "",
+      });
+    }
+    return results;
+  }
+
+  // Tesco API response shape
+  const tProducts =
+    json?.elements ??
+    json?.data?.results?.productItems ??
+    json?.productItems ??
+    [];
+  if (tProducts.length) {
+    for (const p of tProducts) {
+      const item = p.product || p;
+      const price = item?.price ?? item?.unitPrice;
+      if (price == null || !item.title) continue;
+      results.push({
+        name: item.title || item.name,
+        store: "Tesco",
+        price: formatPrice(price),
+        unit: item.unitPrice ? `${formatPrice(item.unitPrice)}/${item.unitOfMeasure || "unit"}` : "",
+      });
+    }
+    return results;
+  }
+
+  // Trolley API
+  const tItems =
+    json?.products ??
+    json?.results ??
+    [];
+  if (tItems.length) {
+    return extractNextData({ items: tItems }, store);
+  }
+
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DOM SCRAPE FALLBACK — reads visible price text from rendered page
+// ─────────────────────────────────────────────────────────────────────────────
+async function scrapePricesFromDom(page, store) {
+  return page.evaluate((storeName) => {
+    const items = [];
+    const cards = document.querySelectorAll(
+      '[class*="product"], [class*="Product"], [data-testid*="product"], article'
+    );
+    cards.forEach((card) => {
+      const nameEl =
+        card.querySelector('[class*="title"], [class*="name"], [class*="Title"], h2, h3, h4');
+      const priceEl =
+        card.querySelector('[class*="price"], [class*="Price"], [data-price]');
+      if (!nameEl || !priceEl) return;
+      const priceText = priceEl.textContent.trim();
+      const hasPrice = /£[\d.]+/.test(priceText);
+      if (!hasPrice) return;
+      items.push({
+        name: nameEl.textContent.trim().slice(0, 120),
+        store: storeName,
+        price: priceText.match(/£[\d.]+/)?.[0] ?? priceText,
+        unit: "",
+      });
+    });
+    return items;
+  }, store);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-STORE SEARCH FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+async function searchSainsburys(query) {
+  try {
+    const results = await scrapeWithIntercept(
+      `https://www.sainsburys.co.uk/gol-ui/SearchResults/${encodeURIComponent(query)}`,
+      "Sainsbury's",
+      ["gol-ui/api/products", "api/products"],
+      '[class*="product-list"], [class*="ProductList"]'
+    );
+    console.log(`  Sainsbury's total: ${results.length}`);
+    return results;
+  } catch (err) {
+    console.log(`  Sainsbury's error: ${err.message}`);
+    return [];
+  }
+}
+
+async function searchTesco(query) {
+  try {
+    const results = await scrapeWithIntercept(
+      `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}&count=10`,
+      "Tesco",
+      ["api/product/search", "groceries/api", "search?query="],
+      '[class*="product-list"], .product-list'
+    );
+    console.log(`  Tesco total: ${results.length}`);
+    return results;
+  } catch (err) {
+    console.log(`  Tesco error: ${err.message}`);
+    return [];
+  }
 }
 
 async function searchTrolley(query) {
-  let browser;
   try {
-    browser = await getBrowser();
-  } catch (err) {
-    console.log(`  Playwright unavailable: ${err.message}`);
-    return [];
-  }
-
-  let page;
-  try {
-    const context = await browser.newContext({
-      userAgent: BROWSER_UA,
-      extraHTTPHeaders: { "Accept-Language": "en-GB,en;q=0.9" },
-    });
-
-    page = await context.newPage();
-
-    // Block images/fonts/css to speed up
-    await page.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (["image", "font", "stylesheet", "media"].includes(type)) {
-        route.abort();
-      } else {
-        route.continue();
-      }
-    });
-
-    await page.goto(
+    const results = await scrapeWithIntercept(
       `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
-      { waitUntil: "networkidle", timeout: 30000 }
+      "Trolley",
+      ["trolley.co.uk/api", "trueview", "_data", "products.json"],
+      '[class*="price"], [class*="product-card"]'
     );
-
-    // Wait for price elements
-    await page.waitForSelector('[class*="price"], [data-price]', { timeout: 8000 }).catch(() => {});
-
-    const results = await page.evaluate((q) => {
-      const items = [];
-      const nextEl = document.getElementById("__NEXT_DATA__");
-      if (nextEl) {
-        try {
-          const walk = (obj, depth = 0) => {
-            if (!obj || typeof obj !== "object" || depth > 12) return;
-            if (Array.isArray(obj)) {
-              for (const item of obj) {
-                if (item?.name && (item?.supermarkets || item?.prices || item?.lowestPrice != null)) {
-                  const name = item.name || q;
-                  if (Array.isArray(item.supermarkets)) {
-                    for (const s of item.supermarkets) {
-                      if (s.price != null && s.name)
-                        items.push({ name, store: s.name, price: s.price, unit: s.unitPrice || "" });
-                    }
-                  }
-                  if (item.prices && typeof item.prices === "object") {
-                    for (const [store, price] of Object.entries(item.prices)) {
-                      if (price != null) items.push({ name, store, price, unit: "" });
-                    }
-                  }
-                } else {
-                  walk(item, depth + 1);
-                }
-              }
-            } else {
-              for (const val of Object.values(obj)) walk(val, depth + 1);
-            }
-          };
-          walk(JSON.parse(nextEl.textContent));
-        } catch (_) {}
-      }
-      // DOM fallback
-      if (!items.length) {
-        document.querySelectorAll('[class*="ProductCard"], [class*="product-card"]').forEach((card) => {
-          const name = card.querySelector('[class*="title"], [class*="name"], h2, h3')?.textContent?.trim();
-          const priceText = card.querySelector('[class*="price"]')?.textContent?.trim();
-          const store = card.querySelector("img[alt]")?.alt?.trim();
-          if (name && priceText) items.push({ name, store: store || "Trolley", price: priceText, unit: "" });
-        });
-      }
-      return items;
-    }, query);
-
-    await context.close();
-
-    const formatted = results
-      .map((r) => ({ name: r.name, store: r.store, price: formatPrice(r.price), unit: r.unit || "" }))
-      .filter((r) => r.price != null);
-
-    console.log(`  Trolley: ${formatted.length}`);
-    return formatted;
+    console.log(`  Trolley total: ${results.length}`);
+    return results;
   } catch (err) {
-    console.error(`  Trolley error: ${err.message}`);
-    if (page) await page.close().catch(() => {});
-    // Reset browser on error so next call gets a fresh one
-    playwrightBrowser = null;
+    console.log(`  Trolley error: ${err.message}`);
     return [];
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGGREGATE — all three in parallel
+// AGGREGATE
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchAll(query) {
   console.log(`\nSearching: "${query}"`);
-  const [s, t, tc] = await Promise.allSettled([
+  const [s, t, tr] = await Promise.allSettled([
     searchSainsburys(query),
     searchTesco(query),
     searchTrolley(query),
   ]);
-  const sainsburys = s.status === "fulfilled" ? s.value : [];
-  const tesco      = t.status === "fulfilled" ? t.value : [];
-  const trolley    = tc.status === "fulfilled" ? tc.value : [];
+  const sainsburys = s.status  === "fulfilled" ? s.value  : [];
+  const tesco      = t.status  === "fulfilled" ? t.value  : [];
+  const trolley    = tr.status === "fulfilled" ? tr.value : [];
+  const all = [...sainsburys, ...tesco, ...trolley];
   console.log(
-    `  Results — Sainsbury's: ${sainsburys.length} | Tesco: ${tesco.length} | Trolley: ${trolley.length}`
+    `  Final — Sainsbury's: ${sainsburys.length} | Tesco: ${tesco.length} | Trolley: ${trolley.length}`
   );
-  return [...sainsburys, ...tesco, ...trolley];
+  return all;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -393,9 +416,8 @@ app.post("/compare", async (req, res) => {
   }
 });
 
-// Graceful shutdown
 process.on("SIGTERM", async () => {
-  if (playwrightBrowser) await playwrightBrowser.close().catch(() => {});
+  if (_browser) await _browser.close().catch(() => {});
   process.exit(0);
 });
 
