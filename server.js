@@ -27,14 +27,13 @@ function findCheapest(results) {
     if (n == null) continue;
     if (!best || n < toNumber(best.price)) best = r;
   }
-  return best ? { store: best.store, price: best.price, name: best.name, unit: best.unit || "" } : null;
+  return best
+    ? { store: best.store, price: best.price, name: best.name, unit: best.unit || "" }
+    : null;
 }
 
-const BROWSER_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KHTML, like Gecko Chrome/124.0.0.0 Safari/537.36",
-  "Accept-Language": "en-GB,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-};
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KHTML, like Gecko Chrome/124.0.0.0 Safari/537.36";
 
 async function safeFetch(url, opts = {}, timeoutMs = 20000) {
   const ctrl = new AbortController();
@@ -47,16 +46,18 @@ async function safeFetch(url, opts = {}, timeoutMs = 20000) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SAINSBURY'S
-// API used by their own website — returns JSON directly, no auth needed.
+// SAINSBURY'S — their gol-ui JSON API
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchSainsburys(query) {
-  const url = `https://www.sainsburys.co.uk/gol-ui/api/products?filter%5Bkeyword%5D=${encodeURIComponent(query)}&page_number=1&page_size=10&sortBy=RELEVANCE`;
+  const url =
+    `https://www.sainsburys.co.uk/gol-ui/api/products` +
+    `?filter%5Bkeyword%5D=${encodeURIComponent(query)}&page_number=1&page_size=10&sortBy=RELEVANCE`;
 
   const res = await safeFetch(url, {
     headers: {
-      ...BROWSER_HEADERS,
+      "User-Agent": BROWSER_UA,
       Accept: "application/json",
+      "Accept-Language": "en-GB,en;q=0.9",
       Referer: "https://www.sainsburys.co.uk/",
     },
   });
@@ -69,93 +70,160 @@ async function searchSainsburys(query) {
   const json = await res.json();
   const products = json?.products ?? json?.data?.products ?? [];
 
-  return products.map((p) => {
-    const price = p?.retail_price?.price ?? p?.price ?? p?.unitPrice;
-    const unit  = p?.unit_price?.measure ? `${formatPrice(p.unit_price.price)}/${p.unit_price.measure}` : "";
-    return {
-      name:  p.name || p.full_name || query,
-      store: "Sainsbury's",
-      price: formatPrice(price),
-      unit,
-    };
-  }).filter(r => r.price != null);
+  return products
+    .map((p) => {
+      const price =
+        p?.retail_price?.price ?? p?.price ?? p?.unitPrice ?? p?.pricing?.nowPrice;
+      const unit = p?.unit_price?.measure
+        ? `${formatPrice(p.unit_price.price)}/${p.unit_price.measure}`
+        : "";
+      return {
+        name: p.name || p.full_name || query,
+        store: "Sainsbury's",
+        price: formatPrice(price),
+        unit,
+      };
+    })
+    .filter((r) => r.price != null);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ASDA
-// ASDA's storefront uses a GraphQL endpoint. We POST the query they use.
+// ASDA — try multiple endpoints they've used
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchAsda(query) {
-  const url = "https://groceries.asda.com/api/bgeography/search";
-
-  // ASDA also exposes a simpler REST endpoint used by their mobile app
-  const restUrl = `https://groceries.asda.com/api/v3/items?q=${encodeURIComponent(query)}&store_id=4565&page_num=1&page_size=10&request_origin=gi`;
-
-  let res = await safeFetch(restUrl, {
-    headers: {
-      ...BROWSER_HEADERS,
-      Accept: "application/json",
-      Referer: "https://www.asda.com/",
-      Origin: "https://www.asda.com",
-    },
-  });
-
-  // Fallback to their search API if the v3 endpoint fails
-  if (!res.ok) {
-    console.log(`  ASDA v3 HTTP ${res.status}, trying fallback`);
-    const fallback = `https://groceries.asda.com/api/bgeography/search?q=${encodeURIComponent(query)}&page=1&pageSize=10`;
-    res = await safeFetch(fallback, {
+  // Endpoint 1: their storefront search API (used by the website)
+  const endpoints = [
+    {
+      url: `https://groceries.asda.com/api/bgeography/search?q=${encodeURIComponent(query)}&page=1&pageSize=10&cacheable=true`,
       headers: {
-        ...BROWSER_HEADERS,
+        "User-Agent": BROWSER_UA,
         Accept: "application/json",
+        "Accept-Language": "en-GB,en;q=0.9",
         Referer: "https://www.asda.com/",
+        Origin: "https://www.asda.com",
+        "request-origin": "gi",
+        store: "4565",
       },
-    });
+    },
+    {
+      url: `https://groceries.asda.com/api/v3/items?q=${encodeURIComponent(query)}&store_id=4565&page_num=1&page_size=10&request_origin=gi`,
+      headers: {
+        "User-Agent": BROWSER_UA,
+        Accept: "application/json",
+        "Accept-Language": "en-GB,en;q=0.9",
+        Referer: "https://www.asda.com/",
+        Origin: "https://www.asda.com",
+      },
+    },
+  ];
+
+  for (const ep of endpoints) {
+    try {
+      const res = await safeFetch(ep.url, { headers: ep.headers });
+      if (!res.ok) {
+        console.log(`  ASDA endpoint failed: HTTP ${res.status} — ${ep.url.split("?")[0]}`);
+        continue;
+      }
+      const json = await res.json();
+      const products =
+        json?.data?.itemsAndRecommendations?.[0]?.items?.items ??
+        json?.items?.items ??
+        json?.searchResults?.resultList?.resultListItems ??
+        json?.results ??
+        [];
+
+      const mapped = products
+        .map((p) => {
+          const price =
+            p?.price?.price ??
+            p?.retailPrice ??
+            p?.salePrice ??
+            p?.listPrice ??
+            p?.item?.price?.price;
+          const unit = p?.price?.unitPrice
+            ? `${formatPrice(p.price.unitPrice)}/${p.price.unitOfMeasure || "unit"}`
+            : "";
+          return {
+            name: p.name || p.item?.name || query,
+            store: "Asda",
+            price: formatPrice(price),
+            unit,
+          };
+        })
+        .filter((r) => r.price != null);
+
+      if (mapped.length) return mapped;
+    } catch (err) {
+      console.log(`  ASDA endpoint error: ${err.message}`);
+    }
   }
 
-  if (!res.ok) {
-    console.log(`  ASDA HTTP ${res.status}`);
+  // Last resort: scrape the ASDA search page HTML for JSON-LD prices
+  return searchAsdaScrape(query);
+}
+
+async function searchAsdaScrape(query) {
+  try {
+    const res = await safeFetch(
+      `https://www.asda.com/groceries/search/${encodeURIComponent(query)}`,
+      {
+        headers: {
+          "User-Agent": BROWSER_UA,
+          Accept: "text/html,application/xhtml+xml",
+          "Accept-Language": "en-GB,en;q=0.9",
+        },
+      }
+    );
+    const html = await res.text();
+
+    // Pull prices from __NEXT_DATA__
+    const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!m) return [];
+    const data = JSON.parse(m[1]);
+
+    const results = [];
+    const walk = (obj, depth = 0) => {
+      if (!obj || typeof obj !== "object" || depth > 12) return;
+      if (Array.isArray(obj)) {
+        for (const item of obj) {
+          if (item?.name && (item?.price != null || item?.retailPrice != null)) {
+            const price = item.price ?? item.retailPrice ?? item.salePrice;
+            results.push({
+              name: item.name,
+              store: "Asda",
+              price: formatPrice(price),
+              unit: "",
+            });
+          } else {
+            walk(item, depth + 1);
+          }
+        }
+      } else {
+        for (const val of Object.values(obj)) walk(val, depth + 1);
+      }
+    };
+    walk(data);
+    console.log(`  ASDA scrape: ${results.length} results`);
+    return results.filter((r) => r.price != null);
+  } catch (err) {
+    console.log(`  ASDA scrape error: ${err.message}`);
     return [];
   }
-
-  const json = await res.json();
-
-  // Try multiple response shapes ASDA has used over time
-  const products =
-    json?.data?.itemsAndRecommendations?.[0]?.items?.items ??
-    json?.items?.items ??
-    json?.results ??
-    json?.data?.items ??
-    [];
-
-  return products.map((p) => {
-    const price = p?.price?.price ?? p?.retailPrice ?? p?.salePrice;
-    const unit  = p?.price?.unitPrice ? `${formatPrice(p.price.unitPrice)}/${p.price.unitOfMeasure || "unit"}` : "";
-    return {
-      name:  p.name || p.item?.name || query,
-      store: "Asda",
-      price: formatPrice(price),
-      unit,
-    };
-  }).filter(r => r.price != null);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TROLLEY.CO.UK via Puppeteer
-// Trolley loads prices client-side so we need a real browser.
-// We use puppeteer-core + @sparticuz/chromium for serverless/Docker deploys.
-// Falls back gracefully if puppeteer isn't installed.
+// Uses @sparticuz/chromium which bundles its own Chromium binary — no system
+// Chrome install needed, works on Railway/Render/Docker out of the box.
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchTrolley(query) {
   let puppeteer, chromium;
 
   try {
-    // Try the serverless-friendly combo first (@sparticuz/chromium)
     chromium = require("@sparticuz/chromium");
     puppeteer = require("puppeteer-core");
   } catch (_) {
     try {
-      // Fall back to full puppeteer (local dev)
       puppeteer = require("puppeteer");
       chromium = null;
     } catch (_2) {
@@ -166,71 +234,80 @@ async function searchTrolley(query) {
 
   let browser;
   try {
-    const launchOpts = chromium
-      ? {
-          args: chromium.args,
-          defaultViewport: chromium.defaultViewport,
-          executablePath: await chromium.executablePath(),
-          headless: chromium.headless,
-        }
-      : {
-          headless: "new",
-          args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        };
+    // @sparticuz/chromium provides everything needed — no system deps required
+    const execPath = chromium
+      ? await chromium.executablePath()
+      : undefined;
 
-    browser = await puppeteer.launch(launchOpts);
+    const launchArgs = [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",   // use /tmp instead of /dev/shm (fixes Railway)
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",          // important for constrained environments
+      "--disable-extensions",
+    ];
+
+    browser = await puppeteer.launch({
+      args: chromium ? [...chromium.args, ...launchArgs] : launchArgs,
+      defaultViewport: chromium?.defaultViewport ?? { width: 1280, height: 800 },
+      executablePath: execPath,
+      headless: chromium ? chromium.headless : "new",
+    });
+
     const page = await browser.newPage();
-
-    await page.setUserAgent(BROWSER_HEADERS["User-Agent"]);
+    await page.setUserAgent(BROWSER_UA);
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-GB,en;q=0.9" });
 
-    // Block images/fonts/css to speed up load
+    // Block heavy resources to speed things up
     await page.setRequestInterception(true);
     page.on("request", (req) => {
-      const type = req.resourceType();
-      if (["image", "font", "stylesheet", "media"].includes(type)) {
+      if (["image", "font", "stylesheet", "media"].includes(req.resourceType())) {
         req.abort();
       } else {
         req.continue();
       }
     });
 
-    const searchUrl = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`;
-    await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    await page.goto(
+      `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
+      { waitUntil: "networkidle2", timeout: 30000 }
+    );
 
-    // Wait for price elements to appear
-    await page.waitForSelector('[class*="price"], [data-price], .product-price', { timeout: 10000 }).catch(() => {});
+    // Wait for any price element
+    await page
+      .waitForSelector('[class*="price"], [data-price]', { timeout: 8000 })
+      .catch(() => {});
 
-    // Extract product + price data from the rendered DOM
     const results = await page.evaluate((q) => {
       const items = [];
 
-      // Try __NEXT_DATA__ first (fastest)
+      // __NEXT_DATA__ — fastest path
       const nextEl = document.getElementById("__NEXT_DATA__");
       if (nextEl) {
         try {
-          const data = JSON.parse(nextEl.textContent);
-          // Walk the props tree for product arrays
           const walk = (obj, depth = 0) => {
             if (!obj || typeof obj !== "object" || depth > 12) return;
             if (Array.isArray(obj)) {
               for (const item of obj) {
-                if (item && item.name && (item.supermarkets || item.prices || item.lowestPrice != null)) {
+                if (
+                  item &&
+                  item.name &&
+                  (item.supermarkets || item.prices || item.lowestPrice != null)
+                ) {
                   const name = item.name || q;
                   if (Array.isArray(item.supermarkets)) {
                     for (const s of item.supermarkets) {
-                      if (s.price != null && s.name) {
+                      if (s.price != null && s.name)
                         items.push({ name, store: s.name, price: s.price, unit: s.unitPrice || "" });
-                      }
                     }
                   }
                   if (item.prices && typeof item.prices === "object") {
                     for (const [store, price] of Object.entries(item.prices)) {
                       if (price != null) items.push({ name, store, price, unit: "" });
                     }
-                  }
-                  if (!items.length && item.lowestPrice != null) {
-                    items.push({ name, store: item.cheapestSupermarket || "Unknown", price: item.lowestPrice, unit: "" });
                   }
                 } else {
                   walk(item, depth + 1);
@@ -240,43 +317,33 @@ async function searchTrolley(query) {
               for (const val of Object.values(obj)) walk(val, depth + 1);
             }
           };
-          walk(data);
+          walk(JSON.parse(nextEl.textContent));
         } catch (_) {}
       }
 
-      // DOM fallback — scrape visible price elements
+      // DOM fallback
       if (!items.length) {
-        const cards = document.querySelectorAll('[class*="product-card"], [class*="ProductCard"], [data-testid*="product"]');
-        cards.forEach((card) => {
-          const nameEl = card.querySelector('[class*="name"], [class*="title"], h2, h3');
-          const priceEl = card.querySelector('[class*="price"], [data-price]');
-          const storeEl = card.querySelector('[class*="store"], [class*="supermarket"], img[alt]');
-          if (nameEl && priceEl) {
-            items.push({
-              name:  nameEl.textContent.trim(),
-              store: storeEl?.alt || storeEl?.textContent?.trim() || "Trolley",
-              price: priceEl.textContent.trim().replace(/[^£\d.]/g, ""),
-              unit:  "",
-            });
-          }
-        });
+        document
+          .querySelectorAll('[class*="product"], [data-testid*="product"]')
+          .forEach((card) => {
+            const name = card.querySelector('[class*="name"], h2, h3')?.textContent?.trim();
+            const price = card.querySelector('[class*="price"]')?.textContent?.trim();
+            const store = card.querySelector("img[alt]")?.alt?.trim();
+            if (name && price) items.push({ name, store: store || "Trolley", price, unit: "" });
+          });
       }
 
       return items;
     }, query);
 
-    const formatted = results.map((r) => ({
-      name:  r.name,
-      store: r.store,
-      price: formatPrice(r.price),
-      unit:  r.unit || "",
-    })).filter((r) => r.price != null);
+    const formatted = results
+      .map((r) => ({ name: r.name, store: r.store, price: formatPrice(r.price), unit: r.unit || "" }))
+      .filter((r) => r.price != null);
 
-    console.log(`  Trolley puppeteer: ${formatted.length} results`);
+    console.log(`  Trolley: ${formatted.length} results`);
     return formatted;
-
   } catch (err) {
-    console.error("  Trolley puppeteer error:", err.message);
+    console.error("  Trolley error:", err.message);
     return [];
   } finally {
     if (browser) await browser.close().catch(() => {});
@@ -284,38 +351,32 @@ async function searchTrolley(query) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGGREGATE: run all three in parallel, merge + dedupe
+// AGGREGATE
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchAll(query) {
-  console.log(`\nSearching all stores for: "${query}"`);
-
-  const [sainsburys, asda, trolley] = await Promise.allSettled([
+  console.log(`\nSearching: "${query}"`);
+  const [s, a, t] = await Promise.allSettled([
     searchSainsburys(query),
     searchAsda(query),
     searchTrolley(query),
   ]);
-
-  const s = sainsburys.status === "fulfilled" ? sainsburys.value : [];
-  const a = asda.status      === "fulfilled" ? asda.value      : [];
-  const t = trolley.status   === "fulfilled" ? trolley.value   : [];
-
-  console.log(`  Sainsbury's: ${s.length} | ASDA: ${a.length} | Trolley: ${t.length}`);
-
-  return [...s, ...a, ...t];
+  const sainsburys = s.status === "fulfilled" ? s.value : [];
+  const asda       = a.status === "fulfilled" ? a.value : [];
+  const trolley    = t.status === "fulfilled" ? t.value : [];
+  console.log(`  Sainsbury's: ${sainsburys.length} | ASDA: ${asda.length} | Trolley: ${trolley.length}`);
+  return [...sainsburys, ...asda, ...trolley];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/", (_, res) => {
-  res.send("Grocery price API. GET /search?q=milk  |  POST /compare { items: ['milk','bread'] }");
+  res.send("Grocery price API — GET /search?q=milk  |  POST /compare { items: ['milk','bread'] }");
 });
 
-// GET /search?q=milk
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
-
   try {
     const results = await searchAll(query);
     res.json({ query, results });
@@ -325,13 +386,11 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// POST /compare { items: ["milk", "bread"] }  or  { q: "milk" }
 app.post("/compare", async (req, res) => {
   const body = req.body || {};
   const items = Array.isArray(body.items) ? body.items : body.q ? [body.q] : [];
   if (!items.length)
     return res.status(400).json({ error: 'Send { "items": ["milk","bread"] } or { "q": "milk" }' });
-
   try {
     const itemResults = await Promise.all(
       items.map(async (q) => {
