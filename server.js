@@ -539,13 +539,22 @@ app.get("/debug-search", async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/debug-autosuggest", async (req, res) => {
   const letter = (req.query.letter ?? "m")[0].toLowerCase();
+  const from = parseInt(req.query.from ?? "0", 10);
+  const len = parseInt(req.query.len ?? "4000", 10);
   const { cookieStr } = await getSessionCookies();
   const url = `https://www.trolley.co.uk/autosuggest_${letter}.js`;
   const r = await safeFetch(url, {
     headers: { ...BASE_HEADERS, Cookie: cookieStr },
   });
   const text = await r.text();
-  res.type("text/plain").send(`// ${url}\n// status: ${r.status}\n// length: ${text.length}\n\n${text.slice(0, 3000)}`);
+
+  // Also list all top-level variable names declared in the file
+  const varNames = [...text.matchAll(/^var\s+(\w+)\s*=/gm)].map(m => m[1]);
+
+  res.type("text/plain").send(
+    `// ${url}\n// status: ${r.status}\n// length: ${text.length}\n// vars: ${varNames.join(", ")}\n// showing chars ${from}–${from + len}\n\n` +
+    text.slice(from, from + len)
+  );
 });
 
 const PORT = process.env.PORT || 3000;
