@@ -12,9 +12,6 @@ const HEADERS = {
   "Referer": "https://www.trolley.co.uk/",
 };
 
-// ---------------------------------------------------------------------------
-// Helper: fetch with timeout
-// ---------------------------------------------------------------------------
 async function safeFetch(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -27,48 +24,64 @@ async function safeFetch(url, options = {}, timeoutMs = 12000) {
 
 // ---------------------------------------------------------------------------
 // Step 1: Search trolley.co.uk and extract product IDs from the HTML
-// Product IDs are 3 uppercase letters + 3 digits e.g. MOZ184, SOY634
 // ---------------------------------------------------------------------------
 async function searchTrolley(query) {
   const url = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}&filter_menus=1`;
+  console.log(`  [trolley] fetching: ${url}`);
 
   const res = await safeFetch(url, { headers: HEADERS }, 12000);
-  if (!res.ok) throw new Error(`Trolley search HTTP ${res.status}`);
+  console.log(`  [trolley] status: ${res.status}, content-type: ${res.headers.get("content-type")}`);
+
   const html = await res.text();
 
-  // Extract product IDs — they appear in data attributes and JS arrays in the page
-  // Pattern: 3 uppercase letters followed by 3 digits
-  const idPattern = /\b([A-Z]{3}[0-9]{3})\b/g;
-  const allMatches = [...html.matchAll(idPattern)].map(m => m[1]);
+  // Log first 1000 chars so we can see what's actually returned
+  console.log(`  [trolley] response preview:\n${html.slice(0, 1000)}\n---`);
 
-  // Deduplicate while preserving order
+  // Try multiple ID patterns found on trolley.co.uk
+  // Pattern 1: 3 uppercase letters + 3 digits e.g. MOZ184
+  const pattern1 = /\b([A-Z]{3}[0-9]{3})\b/g;
+  // Pattern 2: data-product_id or data-id attributes
+  const pattern2 = /data-product[_-]?id="([^"]+)"/gi;
+  const pattern3 = /data-id="([^"]+)"/gi;
+  // Pattern 4: product_id in JS variables
+  const pattern4 = /product_id['":\s]+['"]([^'"]+)['"]/gi;
+  // Pattern 5: href containing /product/ path
+  const pattern5 = /\/product\/([a-z0-9-]+)\//gi;
+
   const seen = new Set();
   const productIds = [];
-  for (const id of allMatches) {
-    if (!seen.has(id)) {
-      seen.add(id);
-      productIds.push(id);
-    }
-  }
 
-  console.log(`  [trolley search] found ${productIds.length} product IDs for "${query}"`);
-  return productIds.slice(0, 10); // take top 10 results
+  const addIds = (pattern) => {
+    for (const m of html.matchAll(pattern)) {
+      const id = m[1];
+      if (!seen.has(id)) {
+        seen.add(id);
+        productIds.push(id);
+      }
+    }
+  };
+
+  addIds(pattern1);
+  addIds(pattern2);
+  addIds(pattern3);
+  addIds(pattern4);
+  addIds(pattern5);
+
+  console.log(`  [trolley] found ${productIds.length} product IDs: ${productIds.slice(0, 10).join(", ")}`);
+  return productIds.slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: Get prices for a list of product IDs via trueview.php
-// Returns store prices for each product
+// Step 2: Get prices via trueview.php
 // ---------------------------------------------------------------------------
 async function getTrueviewPrices(productIds) {
   if (productIds.length === 0) return [];
 
-  // Build pipe-separated lists
   const idParam = productIds.join("|");
   const posParam = productIds.map((_, i) => i + 1).join("|");
+  const url = `https://www.trolley.co.uk/_library/ajax/trueview.php?product_id=${encodeURIComponent(idParam)}&p=${encodeURIComponent(posParam)}&sid=`;
 
-  const url =
-    `https://www.trolley.co.uk/_library/ajax/trueview.php` +
-    `?product_id=${encodeURIComponent(idParam)}&p=${encodeURIComponent(posParam)}&sid=`;
+  console.log(`  [trueview] fetching prices for: ${productIds.slice(0, 5).join(", ")}...`);
 
   const res = await safeFetch(url, {
     headers: {
@@ -78,39 +91,35 @@ async function getTrueviewPrices(productIds) {
     },
   }, 12000);
 
-  if (!res.ok) throw new Error(`Trueview HTTP ${res.status}`);
-
+  console.log(`  [trueview] status: ${res.status}`);
   const text = await res.text();
+  console.log(`  [trueview] response preview:\n${text.slice(0, 1000)}\n---`);
 
-  // Try to parse as JSON
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    console.warn("  [trueview] non-JSON response, trying to extract prices from HTML");
-    return parseTrueviewHtml(text, productIds);
+    console.warn("  [trueview] not JSON, trying HTML parser");
+    return parseTrueviewHtml(text);
   }
 
-  return parseTrueviewJson(data, productIds);
+  return parseTrueviewJson(data);
 }
 
 // ---------------------------------------------------------------------------
-// Parse trueview JSON response
-// Structure may vary — we look for price, store name, product name
+// Parse JSON response — log the raw structure so we can see what keys exist
 // ---------------------------------------------------------------------------
-function parseTrueviewJson(data, productIds) {
+function parseTrueviewJson(data) {
+  console.log(`  [trueview] JSON keys: ${JSON.stringify(Object.keys(data ?? {}))}`);
   const results = [];
 
-  // Handle array of products
   const items = Array.isArray(data) ? data : (data.products ?? data.results ?? data.items ?? Object.values(data));
 
   for (const item of items) {
     if (!item || typeof item !== "object") continue;
 
-    // Each item may contain multiple store prices
-    const stores = item.stores ?? item.prices ?? item.retailers ?? (Array.isArray(item) ? item : null);
-
     const productName = item.name ?? item.title ?? item.product_name ?? "";
+    const stores = item.stores ?? item.prices ?? item.retailers ?? [];
 
     if (Array.isArray(stores)) {
       for (const store of stores) {
@@ -118,7 +127,7 @@ function parseTrueviewJson(data, productIds) {
         const storeName = store.store ?? store.retailer ?? store.name ?? store.source ?? "";
         if (price != null && storeName) {
           results.push({
-            name: productName || storeName,
+            name: productName,
             price: formatPrice(price),
             unit: store.unit_price ?? store.per_unit ?? "",
             store: storeName,
@@ -126,7 +135,7 @@ function parseTrueviewJson(data, productIds) {
         }
       }
     } else {
-      // Maybe flat structure: { name, tesco_price, asda_price, ... }
+      // Flat structure: tesco_price, asda_price etc.
       const storeKeys = ["tesco", "sainsburys", "asda", "morrisons", "ocado", "aldi", "lidl", "waitrose", "iceland", "coop"];
       for (const key of storeKeys) {
         const price = item[`${key}_price`] ?? item[key];
@@ -135,7 +144,7 @@ function parseTrueviewJson(data, productIds) {
             name: productName,
             price: formatPrice(price),
             unit: item[`${key}_unit`] ?? "",
-            store: capitalise(key),
+            store: key.charAt(0).toUpperCase() + key.slice(1),
           });
         }
       }
@@ -145,82 +154,44 @@ function parseTrueviewJson(data, productIds) {
   return results;
 }
 
-// ---------------------------------------------------------------------------
-// Fallback: parse trueview HTML response for price data
-// Trolley sometimes returns an HTML snippet rather than JSON
-// ---------------------------------------------------------------------------
-function parseTrueviewHtml(html, productIds) {
+function parseTrueviewHtml(html) {
   const results = [];
-
-  // Look for price patterns like £1.50, 1.50, etc near store names
   const storePatterns = [
-    { name: "Tesco", pattern: /tesco[^£]*£([\d.]+)/gi },
-    { name: "Sainsbury's", pattern: /sainsbury[^£]*£([\d.]+)/gi },
-    { name: "ASDA", pattern: /asda[^£]*£([\d.]+)/gi },
-    { name: "Morrisons", pattern: /morrison[^£]*£([\d.]+)/gi },
-    { name: "Ocado", pattern: /ocado[^£]*£([\d.]+)/gi },
-    { name: "Waitrose", pattern: /waitrose[^£]*£([\d.]+)/gi },
-    { name: "Iceland", pattern: /iceland[^£]*£([\d.]+)/gi },
-    { name: "Aldi", pattern: /aldi[^£]*£([\d.]+)/gi },
+    { name: "Tesco",        pattern: /tesco[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "Sainsbury's",  pattern: /sainsbury[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "ASDA",         pattern: /asda[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "Morrisons",    pattern: /morrison[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "Ocado",        pattern: /ocado[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "Waitrose",     pattern: /waitrose[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "Iceland",      pattern: /iceland[^£\n]{0,60}£([\d.]+)/gi },
+    { name: "Aldi",         pattern: /aldi[^£\n]{0,60}£([\d.]+)/gi },
   ];
-
-  // Also try to get product name from HTML title tags
-  const nameMatch = html.match(/<(?:h[1-3]|strong|b)[^>]*>([^<]{3,80})<\/(?:h[1-3]|strong|b)>/i);
-  const productName = nameMatch ? nameMatch[1].trim() : "";
-
   for (const { name, pattern } of storePatterns) {
     const match = pattern.exec(html);
-    if (match) {
-      results.push({
-        name: productName,
-        price: `£${parseFloat(match[1]).toFixed(2)}`,
-        unit: "",
-        store: name,
-      });
-    }
+    if (match) results.push({ name: "", price: `£${parseFloat(match[1]).toFixed(2)}`, unit: "", store: name });
   }
-
   return results;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 function formatPrice(price) {
   const num = parseFloat(String(price).replace(/[^0-9.]/g, ""));
   if (isNaN(num)) return String(price);
-  // Trolley sometimes stores prices in pence (integers > 20 without decimal)
-  // Heuristic: if value > 20 and no decimal point in original, treat as pence
-  if (num > 20 && !String(price).includes(".") && num === Math.floor(num)) {
-    return `£${(num / 100).toFixed(2)}`;
-  }
+  if (num > 20 && !String(price).includes(".") && num === Math.floor(num)) return `£${(num / 100).toFixed(2)}`;
   return `£${num.toFixed(2)}`;
 }
 
-function capitalise(str) {
-  return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
-}
-
 // ---------------------------------------------------------------------------
-// GET /search?q=milk
+// Routes
 // ---------------------------------------------------------------------------
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= parameter" });
-
   console.log(`\nSearching: "${query}"`);
-
   try {
-    // Step 1: get product IDs from search page
     const productIds = await searchTrolley(query);
-    if (productIds.length === 0) {
-      return res.json({ query, results: [] });
-    }
-
-    // Step 2: get prices for those products
+    if (productIds.length === 0) return res.json({ query, results: [] });
     const results = await getTrueviewPrices(productIds);
     console.log(`  → ${results.length} store prices returned`);
-
     res.json({ query, results });
   } catch (err) {
     console.error(`  Error: ${err.message}`);
@@ -228,12 +199,6 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// GET /health
-// ---------------------------------------------------------------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 app.listen(3000, () => console.log("Running on port 3000"));
