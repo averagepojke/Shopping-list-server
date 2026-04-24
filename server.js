@@ -12,6 +12,7 @@ const BASE_HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
   "Accept-Language": "en-GB,en;q=0.9",
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Encoding": "gzip, deflate, br",
 };
 
 // ---------------------------------------------------------------------------
@@ -34,13 +35,23 @@ async function safeFetch(url, headers = {}, timeout = 15000) {
 }
 
 // ---------------------------------------------------------------------------
-// STEP 0: Get session cookies (IMPORTANT)
+// STEP 0: Get real session cookies
 // ---------------------------------------------------------------------------
 async function getCookies() {
-  const res = await safeFetch("https://www.trolley.co.uk/");
-  const cookies = res.headers.raw()["set-cookie"] || [];
+  const res = await safeFetch("https://www.trolley.co.uk/", {
+    Referer: "https://www.google.com/",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+  });
 
-  const cookieStr = cookies.map(c => c.split(";")[0]).join("; ");
+  const raw = res.headers.raw()["set-cookie"] || [];
+
+  const cookies = raw
+    .map((c) => c.split(";")[0])
+    .filter((c) => !c.includes("deleted"));
+
+  const cookieStr = cookies.join("; ");
 
   console.log("Cookies:", cookieStr || "(none)");
 
@@ -70,18 +81,18 @@ function extractProducts(html) {
     }
   }
 
-  console.log("Extracted IDs:", products.map(p => p.id));
+  console.log("Extracted IDs:", products.map((p) => p.id));
 
   return products.slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
-// Fetch prices
+// Fetch prices from trueview
 // ---------------------------------------------------------------------------
-async function fetchPrices(products, cookieStr) {
+async function fetchPrices(products, cookieStr, query) {
   if (products.length === 0) return [];
 
-  const ids = products.map(p => p.id);
+  const ids = products.map((p) => p.id);
   const pos = ids.map((_, i) => i + 1);
 
   const url =
@@ -93,24 +104,28 @@ async function fetchPrices(products, cookieStr) {
   const res = await safeFetch(url, {
     Accept: "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
-    Referer: "https://www.trolley.co.uk/search/",
+    Referer: `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
     Cookie: cookieStr,
   });
 
   const text = await res.text();
 
   console.log("trueview length:", text.length);
-  console.log("trueview preview:", text.slice(0, 300));
+  console.log("trueview preview:", text.slice(0, 200));
 
+  let data;
   try {
-    const data = JSON.parse(text);
-    return parsePrices(data, products);
+    data = JSON.parse(text);
   } catch {
     console.log("❌ trueview NOT JSON");
     return [];
   }
+
+  return parsePrices(data, products);
 }
 
+// ---------------------------------------------------------------------------
+// Parse prices
 // ---------------------------------------------------------------------------
 function parsePrices(data, products) {
   const results = [];
@@ -122,9 +137,10 @@ function parsePrices(data, products) {
   for (const [id, item] of items) {
     if (!item || typeof item !== "object") continue;
 
-    const product = products.find(p => p.id === id);
+    const product = products.find((p) => p.id === id);
     const name = product?.name || id;
 
+    // Standard structure
     if (Array.isArray(item.stores)) {
       for (const s of item.stores) {
         if (!s.price || !s.store) continue;
@@ -132,8 +148,21 @@ function parsePrices(data, products) {
         results.push({
           name,
           store: s.store,
-          price: `£${parseFloat(s.price).toFixed(2)}`,
+          price: formatPrice(s.price),
           unit: s.unit_price || "",
+        });
+      }
+    }
+
+    // Flat fallback
+    for (const [k, v] of Object.entries(item)) {
+      if (k.endsWith("_price") && v) {
+        const store = k.replace("_price", "");
+        results.push({
+          name,
+          store,
+          price: formatPrice(v),
+          unit: item[`${store}_unit`] || "",
         });
       }
     }
@@ -143,11 +172,19 @@ function parsePrices(data, products) {
 }
 
 // ---------------------------------------------------------------------------
-app.get("/", (_, res) => {
-  res.send("Use /search?q=milk");
-});
+function formatPrice(p) {
+  const num = parseFloat(String(p).replace(/[^\d.]/g, ""));
+  if (isNaN(num)) return p;
+  return `£${num.toFixed(2)}`;
+}
 
 // ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+app.get("/", (_, res) => {
+  res.send("API running. Use /search?q=milk");
+});
+
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q=" });
@@ -162,12 +199,12 @@ app.get("/search", async (req, res) => {
     const r = await safeFetch(url, {
       Referer: "https://www.trolley.co.uk/",
       Cookie: cookieStr,
+      "Upgrade-Insecure-Requests": "1",
     });
 
     const html = await r.text();
 
     console.log("HTML length:", html.length);
-    console.log("HTML preview:", html.slice(0, 300));
 
     const products = extractProducts(html);
 
@@ -176,7 +213,7 @@ app.get("/search", async (req, res) => {
       return res.json({ query, results: [] });
     }
 
-    const results = await fetchPrices(products, cookieStr);
+    const results = await fetchPrices(products, cookieStr, query);
 
     console.log("Final results:", results.length);
 
