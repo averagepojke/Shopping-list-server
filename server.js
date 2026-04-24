@@ -63,7 +63,6 @@ async function newPage() {
   });
   const page = await ctx.newPage();
 
-  // Block images/fonts/media/stylesheets to speed up page loads
   await page.route("**/*", (route) => {
     if (["image", "font", "media", "stylesheet"].includes(route.request().resourceType())) {
       route.abort();
@@ -77,36 +76,54 @@ async function newPage() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TROLLEY DOM SCRAPER
-// Trolley search page renders .product-item cards whose innerText looks like:
-//   "320g\nSainsbury's\nBritish Fresh Chicken Thigh Fillets\n368\n£3.75\n£1.17 per 100g"
+// Each .product-item innerText looks like:
+//   "320g\nSainsbury's\nProduct Name\n368\n£3.75\n£1.17 per 100g"
 // We parse line-by-line: find price, find store, find product name.
 // ─────────────────────────────────────────────────────────────────────────────
 async function scrapeTrolley(page) {
   return page.evaluate(() => {
-    // Map raw store label text → canonical store name
     const STORE_MAP = {
-      "Asda": "Asda", "ASDA": "Asda",
-      "Tesco": "Tesco", "Tesco Finest": "Tesco", "Tesco Everyday Value": "Tesco",
-      "Sainsbury's": "Sainsbury's", "Sainsburys": "Sainsbury's",
+      "Asda": "Asda",
+      "ASDA": "Asda",
+      "Exceptional by ASDA": "Asda",
+      "Exceptional By Asda": "Asda",
+      "Tesco": "Tesco",
+      "Tesco Finest": "Tesco",
+      "Tesco Everyday Value": "Tesco",
+      "Tesco F&F": "Tesco",
+      "Sainsbury's": "Sainsbury's",
+      "Sainsburys": "Sainsbury's",
       "Sainsbury's Taste the Difference": "Sainsbury's",
-      "Morrisons": "Morrisons", "Morrisons Savers": "Morrisons",
-      "Co-op": "Co-op", "Coop": "Co-op", "The Co-operative": "Co-op",
+      "Taste the Difference": "Sainsbury's",
+      "Morrisons": "Morrisons",
+      "Morrisons Savers": "Morrisons",
+      "Co-op": "Co-op",
+      "Coop": "Co-op",
+      "The Co-operative": "Co-op",
       "Iceland": "Iceland",
+      "The Food Warehouse": "Iceland",
       "Boots": "Boots",
       "Superdrug": "Superdrug",
-      "ALDI": "Aldi", "Aldi": "Aldi", "Specially Selected": "Aldi",
-      "Waitrose": "Waitrose", "Waitrose Ltd": "Waitrose",
+      "ALDI": "Aldi",
+      "Aldi": "Aldi",
+      "Specially Selected": "Aldi",
+      "Waitrose": "Waitrose",
+      "Waitrose Ltd": "Waitrose",
       "B&M": "B&M",
       "Poundland": "Poundland",
       "Savers": "Savers",
       "Ocado": "Ocado",
       "Amazon": "Amazon",
-      "Ebay": "eBay", "eBay": "eBay",
-      "M&S": "M&S", "Marks & Spencer": "M&S",
+      "Ebay": "eBay",
+      "eBay": "eBay",
+      "M&S": "M&S",
+      "M&s": "M&S",
+      "Marks & Spencer": "M&S",
       "Lidl": "Lidl",
       "Holland & Barrett": "Holland & Barrett",
-      "Exceptional by ASDA": "Asda", "Exceptional By Asda": "Asda",
-      "Taste Inc": "Taste Inc", "Taste Inc. Protein": "Taste Inc",
+      "Taste Inc": "Taste Inc",
+      "Taste Inc. Protein": "Taste Inc",
+      "Birds Eye": "Birds Eye",
     };
     const KNOWN_STORES = new Set(Object.keys(STORE_MAP));
 
@@ -119,7 +136,7 @@ async function scrapeTrolley(page) {
 
       const lines = raw.split(/\n/).map(l => l.trim()).filter(Boolean);
 
-      // Find price line — exactly matches £X.XX
+      // Price line — exactly £X.XX
       const priceLineIdx = lines.findIndex(l => /^£[\d]+\.[\d]{2}$/.test(l));
       if (priceLineIdx === -1) continue;
 
@@ -129,8 +146,8 @@ async function scrapeTrolley(page) {
       const unitLine = lines[priceLineIdx + 1] || "";
       const unit = /per/.test(unitLine) ? unitLine : "";
 
-      // Find store — scan lines before price for a known store label
-      let store = "Unknown";
+      // Store — first line before price matching a known store
+      let store = "Other";
       let storeLineIdx = -1;
       for (let i = 0; i < priceLineIdx; i++) {
         if (KNOWN_STORES.has(lines[i])) {
@@ -144,8 +161,8 @@ async function scrapeTrolley(page) {
       let productName = null;
       for (let i = 0; i < priceLineIdx; i++) {
         if (i === storeLineIdx) continue;
-        if (/^\d+$/.test(lines[i])) continue;                    // review count
-        if (/^\d+(g|ml|kg|l)$/.test(lines[i])) continue;        // size token
+        if (/^\d+$/.test(lines[i])) continue;
+        if (/^\d+(g|ml|kg|l|L)$/.test(lines[i])) continue;
         if (lines[i].length < 4) continue;
         if (!productName || lines[i].length > productName.length) {
           productName = lines[i];
@@ -157,7 +174,7 @@ async function scrapeTrolley(page) {
       items.push({ name: productName.slice(0, 150), store, price, unit });
     }
 
-    // Deduplicate by name+store+price
+    // Deduplicate
     const seen = new Map();
     for (const item of items) {
       const key = `${item.name}|${item.store}|${item.price}`;
@@ -168,33 +185,29 @@ async function scrapeTrolley(page) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SEARCH TROLLEY
-// Tesco and Sainsbury's block headless browsers (Akamai). We get their prices
-// via Trolley which aggregates all UK supermarkets.
+// SCRAPE A SINGLE TROLLEY PAGE
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchTrolley(query) {
+async function scrapeTrolleyPage(query, pageNum) {
   const { page, ctx } = await newPage();
   try {
-    await page.goto(
-      `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
-      { waitUntil: "domcontentloaded", timeout: 25000 }
-    );
+    const url = pageNum === 1
+      ? `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`
+      : `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}&p=${pageNum}`;
 
-    // Wait for product cards to appear
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+
     await Promise.race([
       page.waitForSelector(".product-item", { timeout: 10000 }),
-      page.waitForSelector('[class*="price"]', { timeout: 10000 }),
       page.waitForTimeout(8000),
     ]).catch(() => {});
 
-    // Extra settle for lazy-loaded content
     await page.waitForTimeout(2000);
 
     const results = await scrapeTrolley(page);
-    console.log(`  Trolley total: ${results.length}`);
+    console.log(`  Trolley p${pageNum}: ${results.length}`);
     return results;
   } catch (err) {
-    console.log(`  Trolley error: ${err.message}`);
+    console.log(`  Trolley p${pageNum} error: ${err.message}`);
     return [];
   } finally {
     await ctx.close().catch(() => {});
@@ -202,12 +215,37 @@ async function searchTrolley(query) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGGREGATE — Trolley covers all major UK supermarkets
+// SEARCH TROLLEY — fetches N pages in parallel and merges results
+// Default 3 pages (~60 products). Pass ?pages=5 for more.
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchAll(query) {
-  console.log(`\nSearching: "${query}"`);
-  const results = await searchTrolley(query);
-  // Group by store for logging
+async function searchTrolley(query, pages = 3) {
+  const pageNums = Array.from({ length: pages }, (_, i) => i + 1);
+
+  const pageResults = await Promise.allSettled(
+    pageNums.map(n => scrapeTrolleyPage(query, n))
+  );
+
+  // Merge and deduplicate across all pages
+  const seen = new Map();
+  for (const r of pageResults) {
+    if (r.status !== "fulfilled") continue;
+    for (const item of r.value) {
+      const key = `${item.name}|${item.store}|${item.price}`;
+      if (!seen.has(key)) seen.set(key, item);
+    }
+  }
+
+  const results = [...seen.values()];
+  console.log(`  Trolley total (${pages} pages): ${results.length}`);
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGGREGATE
+// ─────────────────────────────────────────────────────────────────────────────
+async function searchAll(query, pages = 3) {
+  console.log(`\nSearching: "${query}" (${pages} pages)`);
+  const results = await searchTrolley(query, pages);
   const byStore = {};
   for (const r of results) byStore[r.store] = (byStore[r.store] || 0) + 1;
   console.log("  By store:", JSON.stringify(byStore));
@@ -220,8 +258,8 @@ async function searchAll(query) {
 app.get("/", (_, res) => {
   res.send(
     "Grocery price API\n" +
-    "  GET  /search?q=milk\n" +
-    "  POST /compare  { items: ['milk','bread'] }\n" +
+    "  GET  /search?q=milk[&pages=3]\n" +
+    "  POST /compare  { items: ['milk','bread'], pages: 3 }\n" +
     "  GET  /debug?q=chicken"
   );
 });
@@ -229,9 +267,10 @@ app.get("/", (_, res) => {
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
+  const pages = Math.min(parseInt(req.query.pages) || 3, 10);
   try {
-    const results = await searchAll(query);
-    res.json({ query, results, cheapest: findCheapest(results) });
+    const results = await searchAll(query, pages);
+    res.json({ query, pages, total: results.length, results, cheapest: findCheapest(results) });
   } catch (err) {
     console.error("ERROR /search:", err.message);
     res.status(500).json({ error: err.message });
@@ -242,19 +281,20 @@ app.post("/compare", async (req, res) => {
   const body = req.body || {};
   const items = Array.isArray(body.items) ? body.items : body.q ? [body.q] : [];
   if (!items.length)
-    return res.status(400).json({ error: 'Send { "items": ["milk","bread"] } or { "q": "milk" }' });
+    return res.status(400).json({ error: 'Send { "items": ["milk","bread"] }' });
+  const pages = Math.min(parseInt(body.pages) || 3, 10);
   try {
     const itemResults = await Promise.all(
       items.map(async (q) => {
         try {
-          const results = await searchAll(q);
-          return { query: q, results, cheapest: findCheapest(results) };
+          const results = await searchAll(q, pages);
+          return { query: q, total: results.length, results, cheapest: findCheapest(results) };
         } catch (err) {
-          return { query: q, results: [], cheapest: null, error: err.message };
+          return { query: q, total: 0, results: [], cheapest: null, error: err.message };
         }
       })
     );
-    res.json({ items: itemResults });
+    res.json({ pages, items: itemResults });
   } catch (err) {
     console.error("ERROR /compare:", err.message);
     res.status(500).json({ error: err.message });
@@ -262,8 +302,7 @@ app.post("/compare", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DEBUG — dumps class names, body text, and what the scraper finds
-// GET /debug?q=chicken
+// DEBUG
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/debug", async (req, res) => {
   const query = req.query.q || "milk";
@@ -295,10 +334,7 @@ app.get("/debug", async (req, res) => {
     const domResults = await scrapeTrolley(page);
 
     res.json({
-      query,
-      url,
-      cardCount,
-      relevantClasses,
+      query, url, cardCount, relevantClasses,
       domResultCount: domResults.length,
       domResultsSample: domResults.slice(0, 15),
       bodyTextSample,
