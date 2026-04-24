@@ -35,36 +35,13 @@ async function safeFetch(url, headers = {}, timeout = 15000) {
 }
 
 // ---------------------------------------------------------------------------
-// STEP 0: Get real session cookies
-// ---------------------------------------------------------------------------
-async function getCookies() {
-  const res = await safeFetch("https://www.trolley.co.uk/", {
-    Referer: "https://www.google.com/",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "no-cache",
-    Pragma: "no-cache",
-  });
-
-  const raw = res.headers.raw()["set-cookie"] || [];
-
-  const cookies = raw
-    .map((c) => c.split(";")[0])
-    .filter((c) => !c.includes("deleted"));
-
-  const cookieStr = cookies.join("; ");
-
-  console.log("Cookies:", cookieStr || "(none)");
-
-  return cookieStr;
-}
-
-// ---------------------------------------------------------------------------
 // Extract product IDs
 // ---------------------------------------------------------------------------
 function extractProducts(html) {
   const seen = new Set();
   const products = [];
 
+  // /product/.../ID
   for (const m of html.matchAll(/\/product\/[^/]+\/([A-Z0-9]{5,})/g)) {
     const id = m[1];
     if (!seen.has(id)) {
@@ -73,6 +50,7 @@ function extractProducts(html) {
     }
   }
 
+  // data-id fallback
   for (const m of html.matchAll(/data-id="([A-Z0-9]{5,})"/g)) {
     const id = m[1];
     if (!seen.has(id)) {
@@ -81,7 +59,7 @@ function extractProducts(html) {
     }
   }
 
-  console.log("Extracted IDs:", products.map((p) => p.id));
+  console.log("Extracted IDs:", products.map(p => p.id));
 
   return products.slice(0, 10);
 }
@@ -90,9 +68,9 @@ function extractProducts(html) {
 // Fetch prices from trueview
 // ---------------------------------------------------------------------------
 async function fetchPrices(products, cookieStr, query) {
-  if (products.length === 0) return [];
+  if (!products.length) return [];
 
-  const ids = products.map((p) => p.id);
+  const ids = products.map(p => p.id);
   const pos = ids.map((_, i) => i + 1);
 
   const url =
@@ -137,10 +115,9 @@ function parsePrices(data, products) {
   for (const [id, item] of items) {
     if (!item || typeof item !== "object") continue;
 
-    const product = products.find((p) => p.id === id);
+    const product = products.find(p => p.id === id);
     const name = product?.name || id;
 
-    // Standard structure
     if (Array.isArray(item.stores)) {
       for (const s of item.stores) {
         if (!s.price || !s.store) continue;
@@ -154,7 +131,7 @@ function parsePrices(data, products) {
       }
     }
 
-    // Flat fallback
+    // fallback
     for (const [k, v] of Object.entries(item)) {
       if (k.endsWith("_price") && v) {
         const store = k.replace("_price", "");
@@ -179,7 +156,7 @@ function formatPrice(p) {
 }
 
 // ---------------------------------------------------------------------------
-// Routes
+// ROUTES
 // ---------------------------------------------------------------------------
 app.get("/", (_, res) => {
   res.send("API running. Use /search?q=milk");
@@ -193,10 +170,24 @@ app.get("/search", async (req, res) => {
     console.log("\n========================");
     console.log("Searching:", query);
 
-    const cookieStr = await getCookies();
+    // STEP 1: Hit homepage to get session cookies
+    const home = await safeFetch("https://www.trolley.co.uk/", {
+      Referer: "https://www.google.com/",
+      "Upgrade-Insecure-Requests": "1",
+    });
 
-    const url = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`;
-    const r = await safeFetch(url, {
+    const homeCookiesRaw = home.headers.raw()["set-cookie"] || [];
+    const cookieStr = homeCookiesRaw
+      .map(c => c.split(";")[0])
+      .filter(c => !c.includes("deleted"))
+      .join("; ");
+
+    console.log("Homepage cookies:", cookieStr || "(none)");
+
+    // STEP 2: Search page WITH cookies
+    const searchUrl = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`;
+
+    const r = await safeFetch(searchUrl, {
       Referer: "https://www.trolley.co.uk/",
       Cookie: cookieStr,
       "Upgrade-Insecure-Requests": "1",
@@ -208,16 +199,18 @@ app.get("/search", async (req, res) => {
 
     const products = extractProducts(html);
 
-    if (products.length === 0) {
+    if (!products.length) {
       console.log("❌ NO PRODUCTS FOUND");
       return res.json({ query, results: [] });
     }
 
+    // STEP 3: trueview using SAME cookies
     const results = await fetchPrices(products, cookieStr, query);
 
     console.log("Final results:", results.length);
 
     res.json({ query, results });
+
   } catch (err) {
     console.error("ERROR:", err.message);
     res.status(500).json({ error: err.message });
