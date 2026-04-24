@@ -216,115 +216,77 @@ async function scrapePricesFromDom(page, store) {
     const items = [];
     const priceRegex = /£([\d]+\.[\d]{2})/;
 
-    // ── Trolley-specific strategies ──────────────────────────────────────────
+    // ── Trolley-specific: parse .product-item cards line by line ────────────
+    // Each card's innerText looks like:
+    //   "320g\nSainsbury's\nBritish Fresh Chicken Thigh Fillets\n368\n£3.75\n£1.17 per 100g"
+    // Store names Trolley uses (for detection):
     if (storeName === "Trolley") {
+      const KNOWN_STORES = new Set([
+        "Asda","Tesco","Sainsbury's","Morrisons","Co-op","Iceland",
+        "Boots","Superdrug","ALDI","Aldi","Waitrose","B&M","Poundland",
+        "Savers","Ocado","Amazon","Ebay","M&S","Lidl","Holland & Barrett",
+      ]);
 
-      // Strategy A — named product/price card selectors (class name variations)
-      const cardSelectors = [
-        '[class*="product-card"]',
-        '[class*="ProductCard"]',
-        '[class*="product-listing"]',
-        '[class*="ProductListing"]',
-        '[class*="product-row"]',
-        '[class*="search-result"]',
-        '[class*="SearchResult"]',
-      ];
-      const cards = document.querySelectorAll(cardSelectors.join(", "));
+      const cards = document.querySelectorAll(".product-item, [class~='product-item']");
 
       for (const card of cards) {
-        const nameEl = card.querySelector(
-          '[class*="product-name"], [class*="ProductName"], ' +
-          '[class*="title"], [class*="name"], h2, h3, h4, a[href*="/product"]'
-        );
-        const storeEl = card.querySelector(
-          '[class*="store-name"], [class*="StoreName"], ' +
-          '[class*="retailer"], [class*="Retailer"], img[alt]'
-        );
-        const priceEl = card.querySelector(
-          '[class*="price"], [class*="Price"], [data-price]'
-        );
+        const raw = (card.innerText || card.textContent || "").trim();
+        if (!raw) continue;
 
-        if (!nameEl || !priceEl) continue;
-        const priceText = priceEl.textContent.trim();
-        const priceMatch = priceText.match(priceRegex);
-        if (!priceMatch) continue;
+        // Split into non-empty lines
+        const lines = raw.split(/\n/).map(l => l.trim()).filter(Boolean);
 
-        let storeName2 = storeName;
-        if (storeEl) {
-          storeName2 = storeEl.getAttribute("alt") || storeEl.textContent.trim() || storeName;
+        // Find the price line — first line matching £X.XX
+        const priceLineIdx = lines.findIndex(l => /^£[\d]+\.[\d]{2}$/.test(l));
+        if (priceLineIdx === -1) continue;
+
+        const price = lines[priceLineIdx];
+
+        // Unit price — next line after price, e.g. "£1.17 per 100g"
+        const unitLine = lines[priceLineIdx + 1] || "";
+        const unit = /per/.test(unitLine) ? unitLine : "";
+
+        // Find store — first line that matches a known store name
+        let store2 = storeName;
+        let storeLineIdx = -1;
+        for (let i = 0; i < priceLineIdx; i++) {
+          if (KNOWN_STORES.has(lines[i])) {
+            store2 = lines[i];
+            storeLineIdx = i;
+            break;
+          }
         }
 
-        items.push({
-          name: nameEl.textContent.trim().slice(0, 120),
-          store: storeName2,
-          price: `£${priceMatch[1]}`,
-          unit: "",
-        });
-      }
-
-      if (items.length) return items;
-
-      // Strategy B — Trolley renders a table/list with store logos + prices
-      // Each row: [store logo img] [product name] [price] [unit price]
-      // Walk all elements with a price and backtrack to find the row context
-      const seen = new Set();
-      const allEls = [...document.querySelectorAll("*")];
-
-      for (const el of allEls) {
-        // Only look at leaf-ish elements that contain a price
-        if (el.children.length > 8) continue;
-        const text = el.textContent.trim();
-        if (!priceRegex.test(text) || text.length > 400) continue;
-        if (seen.has(el)) continue;
-        seen.add(el);
-
-        const priceMatch = text.match(priceRegex);
-        if (!priceMatch) continue;
-
-        // Walk up to find a container with a product name
-        let container = el.parentElement;
+        // Product name — longest non-numeric line before the price that isn't the store
         let productName = null;
-        let storeName2 = storeName;
-
-        for (let i = 0; i < 6 && container; i++, container = container.parentElement) {
-          const containerText = container.textContent || "";
-          if (containerText.length > 600) break;
-
-          // Look for store logo img
-          const img = container.querySelector("img[alt]");
-          if (img && img.alt && img.alt.length < 50 && img.alt.length > 1) {
-            storeName2 = img.alt.trim();
-          }
-
-          // Find the product name: first text chunk that isn't a price and is long enough
-          const lines = containerText
-            .split(/[\n\r]+/)
-            .map((l) => l.trim())
-            .filter((l) => l.length > 5 && l.length < 120 && !priceRegex.test(l));
-
-          if (lines.length > 0) {
-            productName = lines[0];
-            break;
+        for (let i = 0; i < priceLineIdx; i++) {
+          if (i === storeLineIdx) continue;           // skip store line
+          if (/^\d+$/.test(lines[i])) continue;       // skip review counts
+          if (/^\d+g$|^\d+ml$|^\d+kg$/.test(lines[i])) continue; // skip size tokens
+          if (lines[i].length < 4) continue;
+          // Pick the longest candidate as the product name
+          if (!productName || lines[i].length > productName.length) {
+            productName = lines[i];
           }
         }
 
         if (!productName) continue;
 
         items.push({
-          name: productName,
-          store: storeName2,
-          price: `£${priceMatch[1]}`,
-          unit: "",
+          name: productName.slice(0, 150),
+          store: store2,
+          price,
+          unit,
         });
       }
 
       // Deduplicate by name+store+price
-      const dedupedMap = new Map();
+      const seen = new Map();
       for (const item of items) {
         const key = `${item.name}|${item.store}|${item.price}`;
-        if (!dedupedMap.has(key)) dedupedMap.set(key, item);
+        if (!seen.has(key)) seen.set(key, item);
       }
-      return [...dedupedMap.values()];
+      return [...seen.values()];
     }
 
     // ── Generic fallback for Tesco / Sainsbury's DOM ──────────────────────────
