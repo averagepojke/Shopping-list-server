@@ -507,6 +507,50 @@ app.get("/search", async (req, res) => {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// Raw suggest.php output
+app.get("/debug-suggest-php", async (req, res) => {
+  const query = req.query.q ?? "milk";
+  const { cookieStr } = await getSessionCookies();
+  const url = `https://www.trolley.co.uk/_library/ajax/search_suggest.php?q=${encodeURIComponent(query)}`;
+  const r = await safeFetch(url, {
+    headers: {
+      ...BASE_HEADERS,
+      Accept: "text/html, */*; q=0.01",
+      "X-Requested-With": "XMLHttpRequest",
+      Referer: `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
+      Cookie: cookieStr,
+    },
+  });
+  const text = await r.text();
+  res.type("text/plain").send(
+    `// ${url}\n// status: ${r.status}\n// content-type: ${r.headers.get("content-type")}\n// length: ${text.length}\n\n${text.slice(0, 5000)}`
+  );
+});
+
+// Raw search page HTML with landmarks
+app.get("/debug-search-page", async (req, res) => {
+  const query = req.query.q ?? "milk";
+  const from = parseInt(req.query.from ?? "0", 10);
+  const len = parseInt(req.query.len ?? "5000", 10);
+  const { cookieStr } = await getSessionCookies();
+  const url = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`;
+  const r = await safeFetch(url, {
+    headers: { ...BASE_HEADERS, Referer: "https://www.trolley.co.uk/", Cookie: cookieStr },
+  });
+  const text = await r.text();
+  const landmarks = [
+    ["product link", text.indexOf("/product/")],
+    ["__NEXT_DATA__", text.indexOf("__NEXT_DATA__")],
+    ["application/json", text.indexOf("application/json")],
+    ["product_id", text.indexOf("product_id")],
+    ["data-id", text.indexOf("data-id")],
+  ].filter(([, idx]) => idx !== -1).map(([name, idx]) => `${name}@${idx}`);
+  res.type("text/plain").send(
+    `// ${url}\n// status: ${r.status}\n// final url: ${r.url}\n// length: ${text.length}\n// landmarks: ${landmarks.join(", ")}\n// showing chars ${from}\u2013${from + len}\n\n` +
+    text.slice(from, from + len)
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Debug route — dumps all strategy outputs without calling trueview
 // ---------------------------------------------------------------------------
