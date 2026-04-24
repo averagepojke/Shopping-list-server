@@ -181,11 +181,13 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
       { waitUntil: "domcontentloaded", timeout: 25000 }
     );
 
+    // Wait for first products to appear — emit as soon as they do, don't wait longer
     await Promise.race([
       page.waitForSelector(".product-item", { timeout: 10000 }),
       page.waitForTimeout(8000),
     ]).catch(() => {});
-    await page.waitForTimeout(1500);
+    // Short settle — just enough for JS to paint card text, not a full 1.5s stall
+    await page.waitForTimeout(400);
 
     const initialCount = await page.$$eval(".product-item", els => els.length);
     console.log(`  Trolley initial: ${initialCount} products`);
@@ -233,7 +235,7 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
         ".product-item"
       ).catch(() => {});
 
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(300); // short settle then emit immediately
 
       const newCount = await page.$$eval(".product-item", els => els.length);
       console.log(`  Trolley click ${i + 1}: ${newCount} products`);
@@ -335,14 +337,18 @@ app.get("/search/stream", async (req, res) => {
   const clicks = Math.min(parseInt(req.query.clicks) || 4, 10);
 
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // stop nginx/Railway buffering
   res.flushHeaders();
+
+  // Immediate ping so the client knows the stream is alive
+  res.write(": connected\n\n");
 
   const send = (obj) => {
     res.write(`data: ${JSON.stringify(obj)}\n\n`);
-    // flush if available (compression middleware etc.)
     if (typeof res.flush === "function") res.flush();
+    else if (res.socket && typeof res.socket.flush === "function") res.socket.flush();
   };
 
   try {
