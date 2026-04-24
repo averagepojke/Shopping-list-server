@@ -63,7 +63,7 @@ async function newPage() {
   });
   const page = await ctx.newPage();
 
-  // Block images/fonts/media to speed up page loads
+  // Block images/fonts/media/stylesheets to speed up page loads
   await page.route("**/*", (route) => {
     if (["image", "font", "media", "stylesheet"].includes(route.request().resourceType())) {
       route.abort();
@@ -133,8 +133,7 @@ function extractNextData(json, storeName) {
                 });
               }
             }
-          }
-          else {
+          } else {
             walk(item, depth + 1);
           }
         }
@@ -149,72 +148,7 @@ function extractNextData(json, storeName) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INTERCEPT API RESPONSES — catches XHR/fetch calls the page makes
-// This is the most reliable approach: let the real browser make the real
-// requests, intercept the JSON responses as they arrive.
-// ─────────────────────────────────────────────────────────────────────────────
-async function scrapeWithIntercept(url, store, apiPatterns, waitSelector, timeout = 25000) {
-  const { page, ctx } = await newPage();
-  const intercepted = [];
-
-  try {
-    // Intercept API responses matching our patterns
-    page.on("response", async (response) => {
-      const respUrl = response.url();
-      if (apiPatterns.some((p) => respUrl.includes(p))) {
-        try {
-          const json = await response.json();
-          intercepted.push(json);
-          console.log(`  [intercept] ${store}: got response from ${respUrl.split("?")[0]}`);
-        } catch (_) {}
-      }
-    });
-
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-
-    // Wait for a product/price element to appear
-    if (waitSelector) {
-      await page.waitForSelector(waitSelector, { timeout: 12000 }).catch(() => {});
-    } else {
-      await page.waitForTimeout(4000);
-    }
-
-    // Also try __NEXT_DATA__
-    const nextDataText = await page
-      .evaluate(() => document.getElementById("__NEXT_DATA__")?.textContent)
-      .catch(() => null);
-
-    let results = [];
-
-    // Parse intercepted API responses first
-    for (const json of intercepted) {
-      const r = parseStoreJson(json, store);
-      results.push(...r);
-    }
-
-    // Fall back to __NEXT_DATA__
-    if (!results.length && nextDataText) {
-      try {
-        const nd = JSON.parse(nextDataText);
-        results = extractNextData(nd, store);
-        console.log(`  [nextdata] ${store}: ${results.length}`);
-      } catch (_) {}
-    }
-
-    // Last resort: scrape visible price text from DOM
-    if (!results.length) {
-      results = await scrapePricesFromDom(page, store);
-      console.log(`  [dom] ${store}: ${results.length}`);
-    }
-
-    return results;
-  } finally {
-    await ctx.close().catch(() => {});
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PARSE STORE-SPECIFIC JSON RESPONSES
+// PARSE STORE-SPECIFIC JSON RESPONSES (from intercepted XHR/fetch calls)
 // ─────────────────────────────────────────────────────────────────────────────
 function parseStoreJson(json, store) {
   const results = [];
@@ -238,7 +172,7 @@ function parseStoreJson(json, store) {
           : "",
       });
     }
-    return results;
+    if (results.length) return results;
   }
 
   // Tesco API response shape
@@ -256,17 +190,16 @@ function parseStoreJson(json, store) {
         name: item.title || item.name,
         store: "Tesco",
         price: formatPrice(price),
-        unit: item.unitPrice ? `${formatPrice(item.unitPrice)}/${item.unitOfMeasure || "unit"}` : "",
+        unit: item.unitPrice
+          ? `${formatPrice(item.unitPrice)}/${item.unitOfMeasure || "unit"}`
+          : "",
       });
     }
-    return results;
+    if (results.length) return results;
   }
 
-  // Trolley API
-  const tItems =
-    json?.products ??
-    json?.results ??
-    [];
+  // Trolley API fallback
+  const tItems = json?.products ?? json?.results ?? [];
   if (tItems.length) {
     return extractNextData({ items: tItems }, store);
   }
@@ -275,32 +208,209 @@ function parseStoreJson(json, store) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DOM SCRAPE FALLBACK — reads visible price text from rendered page
+// DOM SCRAPE — reads rendered prices from the page
+// Trolley-aware: handles per-store price cards and text-node fallback
 // ─────────────────────────────────────────────────────────────────────────────
 async function scrapePricesFromDom(page, store) {
   return page.evaluate((storeName) => {
     const items = [];
+    const priceRegex = /£([\d]+\.[\d]{2})/;
+
+    // ── Trolley-specific strategies ──────────────────────────────────────────
+    if (storeName === "Trolley") {
+
+      // Strategy A — named product/price card selectors (class name variations)
+      const cardSelectors = [
+        '[class*="product-card"]',
+        '[class*="ProductCard"]',
+        '[class*="product-listing"]',
+        '[class*="ProductListing"]',
+        '[class*="product-row"]',
+        '[class*="search-result"]',
+        '[class*="SearchResult"]',
+      ];
+      const cards = document.querySelectorAll(cardSelectors.join(", "));
+
+      for (const card of cards) {
+        const nameEl = card.querySelector(
+          '[class*="product-name"], [class*="ProductName"], ' +
+          '[class*="title"], [class*="name"], h2, h3, h4, a[href*="/product"]'
+        );
+        const storeEl = card.querySelector(
+          '[class*="store-name"], [class*="StoreName"], ' +
+          '[class*="retailer"], [class*="Retailer"], img[alt]'
+        );
+        const priceEl = card.querySelector(
+          '[class*="price"], [class*="Price"], [data-price]'
+        );
+
+        if (!nameEl || !priceEl) continue;
+        const priceText = priceEl.textContent.trim();
+        const priceMatch = priceText.match(priceRegex);
+        if (!priceMatch) continue;
+
+        let storeName2 = storeName;
+        if (storeEl) {
+          storeName2 = storeEl.getAttribute("alt") || storeEl.textContent.trim() || storeName;
+        }
+
+        items.push({
+          name: nameEl.textContent.trim().slice(0, 120),
+          store: storeName2,
+          price: `£${priceMatch[1]}`,
+          unit: "",
+        });
+      }
+
+      if (items.length) return items;
+
+      // Strategy B — Trolley renders a table/list with store logos + prices
+      // Each row: [store logo img] [product name] [price] [unit price]
+      // Walk all elements with a price and backtrack to find the row context
+      const seen = new Set();
+      const allEls = [...document.querySelectorAll("*")];
+
+      for (const el of allEls) {
+        // Only look at leaf-ish elements that contain a price
+        if (el.children.length > 8) continue;
+        const text = el.textContent.trim();
+        if (!priceRegex.test(text) || text.length > 400) continue;
+        if (seen.has(el)) continue;
+        seen.add(el);
+
+        const priceMatch = text.match(priceRegex);
+        if (!priceMatch) continue;
+
+        // Walk up to find a container with a product name
+        let container = el.parentElement;
+        let productName = null;
+        let storeName2 = storeName;
+
+        for (let i = 0; i < 6 && container; i++, container = container.parentElement) {
+          const containerText = container.textContent || "";
+          if (containerText.length > 600) break;
+
+          // Look for store logo img
+          const img = container.querySelector("img[alt]");
+          if (img && img.alt && img.alt.length < 50 && img.alt.length > 1) {
+            storeName2 = img.alt.trim();
+          }
+
+          // Find the product name: first text chunk that isn't a price and is long enough
+          const lines = containerText
+            .split(/[\n\r]+/)
+            .map((l) => l.trim())
+            .filter((l) => l.length > 5 && l.length < 120 && !priceRegex.test(l));
+
+          if (lines.length > 0) {
+            productName = lines[0];
+            break;
+          }
+        }
+
+        if (!productName) continue;
+
+        items.push({
+          name: productName,
+          store: storeName2,
+          price: `£${priceMatch[1]}`,
+          unit: "",
+        });
+      }
+
+      // Deduplicate by name+store+price
+      const dedupedMap = new Map();
+      for (const item of items) {
+        const key = `${item.name}|${item.store}|${item.price}`;
+        if (!dedupedMap.has(key)) dedupedMap.set(key, item);
+      }
+      return [...dedupedMap.values()];
+    }
+
+    // ── Generic fallback for Tesco / Sainsbury's DOM ──────────────────────────
     const cards = document.querySelectorAll(
       '[class*="product"], [class*="Product"], [data-testid*="product"], article'
     );
     cards.forEach((card) => {
-      const nameEl =
-        card.querySelector('[class*="title"], [class*="name"], [class*="Title"], h2, h3, h4');
-      const priceEl =
-        card.querySelector('[class*="price"], [class*="Price"], [data-price]');
+      const nameEl = card.querySelector(
+        '[class*="title"], [class*="name"], [class*="Title"], h2, h3, h4'
+      );
+      const priceEl = card.querySelector(
+        '[class*="price"], [class*="Price"], [data-price]'
+      );
       if (!nameEl || !priceEl) return;
       const priceText = priceEl.textContent.trim();
-      const hasPrice = /£[\d.]+/.test(priceText);
-      if (!hasPrice) return;
+      const priceMatch = priceText.match(priceRegex);
+      if (!priceMatch) return;
       items.push({
         name: nameEl.textContent.trim().slice(0, 120),
         store: storeName,
-        price: priceText.match(/£[\d.]+/)?.[0] ?? priceText,
+        price: `£${priceMatch[1]}`,
         unit: "",
       });
     });
     return items;
   }, store);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERCEPT API RESPONSES — catches XHR/fetch calls the page makes
+// ─────────────────────────────────────────────────────────────────────────────
+async function scrapeWithIntercept(url, store, apiPatterns, waitSelector, timeout = 25000) {
+  const { page, ctx } = await newPage();
+  const intercepted = [];
+
+  try {
+    page.on("response", async (response) => {
+      const respUrl = response.url();
+      if (apiPatterns.some((p) => respUrl.includes(p))) {
+        try {
+          const json = await response.json();
+          intercepted.push(json);
+          console.log(`  [intercept] ${store}: got response from ${respUrl.split("?")[0]}`);
+        } catch (_) {}
+      }
+    });
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+
+    if (waitSelector) {
+      await page.waitForSelector(waitSelector, { timeout: 12000 }).catch(() => {});
+    } else {
+      await page.waitForTimeout(4000);
+    }
+
+    const nextDataText = await page
+      .evaluate(() => document.getElementById("__NEXT_DATA__")?.textContent)
+      .catch(() => null);
+
+    let results = [];
+
+    // 1. Intercepted API responses
+    for (const json of intercepted) {
+      const r = parseStoreJson(json, store);
+      results.push(...r);
+    }
+
+    // 2. __NEXT_DATA__ fallback
+    if (!results.length && nextDataText) {
+      try {
+        const nd = JSON.parse(nextDataText);
+        results = extractNextData(nd, store);
+        console.log(`  [nextdata] ${store}: ${results.length}`);
+      } catch (_) {}
+    }
+
+    // 3. DOM scrape last resort
+    if (!results.length) {
+      results = await scrapePricesFromDom(page, store);
+      console.log(`  [dom] ${store}: ${results.length}`);
+    }
+
+    return results;
+  } finally {
+    await ctx.close().catch(() => {});
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,14 +450,45 @@ async function searchTesco(query) {
 
 async function searchTrolley(query) {
   try {
-    const results = await scrapeWithIntercept(
-      `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
-      "Trolley",
-      ["trolley.co.uk/api", "trueview", "_data", "products.json"],
-      '[class*="price"], [class*="product-card"]'
-    );
-    console.log(`  Trolley total: ${results.length}`);
-    return results;
+    const { page, ctx } = await newPage();
+    try {
+      await page.goto(
+        `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
+        { waitUntil: "domcontentloaded", timeout: 25000 }
+      );
+
+      // Wait for prices to render — Trolley is JS-heavy, race multiple signals
+      await Promise.race([
+        page.waitForSelector('[class*="price"]', { timeout: 10000 }),
+        page.waitForSelector('[class*="product"]', { timeout: 10000 }),
+        page.waitForSelector('[class*="search-result"]', { timeout: 10000 }),
+        page.waitForTimeout(8000),
+      ]).catch(() => {});
+
+      // Extra settle time for lazy-loaded content
+      await page.waitForTimeout(2000);
+
+      // Strategy 1: DOM scrape (primary for Trolley)
+      let results = await scrapePricesFromDom(page, "Trolley");
+
+      // Strategy 2: __NEXT_DATA__ if DOM scrape failed
+      if (!results.length) {
+        const nextDataText = await page
+          .evaluate(() => document.getElementById("__NEXT_DATA__")?.textContent)
+          .catch(() => null);
+        if (nextDataText) {
+          try {
+            results = extractNextData(JSON.parse(nextDataText), "Trolley");
+            console.log(`  [nextdata] Trolley: ${results.length}`);
+          } catch (_) {}
+        }
+      }
+
+      console.log(`  Trolley total: ${results.length}`);
+      return results;
+    } finally {
+      await ctx.close().catch(() => {});
+    }
   } catch (err) {
     console.log(`  Trolley error: ${err.message}`);
     return [];
@@ -364,8 +505,8 @@ async function searchAll(query) {
     searchTesco(query),
     searchTrolley(query),
   ]);
-  const sainsburys = s.status  === "fulfilled" ? s.value  : [];
-  const tesco      = t.status  === "fulfilled" ? t.value  : [];
+  const sainsburys = s.status === "fulfilled" ? s.value : [];
+  const tesco      = t.status === "fulfilled" ? t.value : [];
   const trolley    = tr.status === "fulfilled" ? tr.value : [];
   const all = [...sainsburys, ...tesco, ...trolley];
   console.log(
@@ -378,7 +519,12 @@ async function searchAll(query) {
 // ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/", (_, res) => {
-  res.send("Grocery price API — GET /search?q=milk  |  POST /compare { items: ['milk','bread'] }");
+  res.send(
+    "Grocery price API\n" +
+    "  GET  /search?q=milk\n" +
+    "  POST /compare  { items: ['milk','bread'] }\n" +
+    "  GET  /debug?q=chicken&store=trolley"
+  );
 });
 
 app.get("/search", async (req, res) => {
@@ -386,7 +532,7 @@ app.get("/search", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
   try {
     const results = await searchAll(query);
-    res.json({ query, results });
+    res.json({ query, results, cheapest: findCheapest(results) });
   } catch (err) {
     console.error("ERROR /search:", err.message);
     res.status(500).json({ error: err.message });
@@ -416,6 +562,68 @@ app.post("/compare", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DEBUG — dumps rendered HTML class names so you can tune selectors
+// GET /debug?q=chicken&store=trolley|tesco|sainsburys
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/debug", async (req, res) => {
+  const query = req.query.q || "milk";
+  const store = (req.query.store || "trolley").toLowerCase();
+  const { page, ctx } = await newPage();
+  try {
+    const urls = {
+      trolley:    `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
+      tesco:      `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}&count=10`,
+      sainsburys: `https://www.sainsburys.co.uk/gol-ui/SearchResults/${encodeURIComponent(query)}`,
+    };
+    const url = urls[store] || urls.trolley;
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+    await page.waitForTimeout(5000);
+
+    const { relevantClasses, bodyText, interceptedUrls } = await page.evaluate(() => {
+      // Collect class names that look price/product related
+      const classSet = new Set();
+      document.querySelectorAll("*").forEach((el) => {
+        el.classList.forEach((c) => {
+          if (/price|product|store|retailer|card|listing|result|search|item/i.test(c)) {
+            classSet.add(c);
+          }
+        });
+      });
+
+      // Grab visible text (first 2000 chars)
+      const bodyText = (document.body.innerText || "").slice(0, 2000);
+
+      return {
+        relevantClasses: [...classSet].sort(),
+        bodyText,
+        interceptedUrls: [],
+      };
+    });
+
+    // Also grab DOM-scraped results to see what we'd get
+    const domResults = await scrapePricesFromDom(page, store === "trolley" ? "Trolley" : store);
+
+    res.json({
+      store,
+      query,
+      url,
+      relevantClasses,
+      domResultCount: domResults.length,
+      domResultsSample: domResults.slice(0, 10),
+      bodyTextSample: bodyText,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────────────────────────────────────
 process.on("SIGTERM", async () => {
   if (_browser) await _browser.close().catch(() => {});
   process.exit(0);
