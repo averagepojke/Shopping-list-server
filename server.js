@@ -645,12 +645,13 @@ app.get("/search/stream", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
   const clicks = Math.min(parseInt(req.query.clicks) || 4, 10);
 
+  const cached = getCached(query);
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
-  // Let the client know if this is a cache hit (results arrive instantly)
-  res.setHeader("X-Cache", getCached(query) ? "HIT" : "MISS");
+  res.setHeader("X-Cache", cached ? "HIT" : "MISS");
   res.flushHeaders();
   res.write(": connected\n\n");
 
@@ -661,15 +662,31 @@ app.get("/search/stream", async (req, res) => {
   };
 
   try {
-    await searchAll(query, clicks, (newItems, allResults, done) => {
-      send({
-        type: "batch",
-        items: newItems,
-        total: allResults.length,
-        cheapest: findCheapest(allResults),
-        done,
+    if (cached) {
+      // Send cached results in chunks of 20 so the client parser
+      // has something to process even if onprogress doesn't fire
+      const CHUNK = 20;
+      const { results } = cached;
+      const cheapest = findCheapest(results);
+      for (let i = 0; i < results.length; i += CHUNK) {
+        const slice = results.slice(i, i + CHUNK);
+        const isLast = i + CHUNK >= results.length;
+        send({ type: "batch", items: slice, total: results.length, cheapest, done: isLast });
+      }
+      if (results.length === 0) {
+        send({ type: "batch", items: [], total: 0, cheapest: null, done: true });
+      }
+    } else {
+      await searchAll(query, clicks, (newItems, allResults, done) => {
+        send({
+          type: "batch",
+          items: newItems,
+          total: allResults.length,
+          cheapest: findCheapest(allResults),
+          done,
+        });
       });
-    });
+    }
   } catch (err) {
     send({ type: "error", message: err.message });
   } finally {
