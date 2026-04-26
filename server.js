@@ -26,85 +26,195 @@ function findCheapest(results) {
     : null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STORE RESOLUTION
+// Exact map first, then keyword matching so sub-brands ("Tesco Finest",
+// "Sainsbury's Taste the Difference", etc.) always resolve to a known store.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STORE_MAP = {
+  // Asda
+  "Asda": "Asda", "ASDA": "Asda",
+  "Exceptional by ASDA": "Asda", "Exceptional By Asda": "Asda",
+  "George at ASDA": "Asda", "George at Asda": "Asda",
+  "Asda Extra Special": "Asda", "ASDA Extra Special": "Asda",
+  "Smart Price": "Asda",
+
+  // Tesco
+  "Tesco": "Tesco", "TESCO": "Tesco",
+  "Tesco Finest": "Tesco", "Tesco Everyday Value": "Tesco",
+  "Tesco Free From": "Tesco", "Tesco Plant Chef": "Tesco",
+  "Tesco Organic": "Tesco", "Tesco Loves Kids": "Tesco",
+  "Tesco Healthy Living": "Tesco", "Tesco Light Choices": "Tesco",
+
+  // Sainsbury's
+  "Sainsbury's": "Sainsbury's", "Sainsburys": "Sainsbury's",
+  "Sainsbury's Taste the Difference": "Sainsbury's", "Taste the Difference": "Sainsbury's",
+  "Sainsbury's by Sainsbury's": "Sainsbury's",
+  "Sainsbury's Free From": "Sainsbury's", "Sainsbury's Organic": "Sainsbury's",
+  "Sainsbury's SO Organic": "Sainsbury's", "SO Organic": "Sainsbury's",
+  "Sainsbury's Kids": "Sainsbury's",
+
+  // Morrisons
+  "Morrisons": "Morrisons", "MORRISONS": "Morrisons",
+  "Morrisons Savers": "Morrisons", "Morrisons The Best": "Morrisons",
+  "The Best": "Morrisons", "M Savers": "Morrisons",
+  "Morrisons Free From": "Morrisons", "Morrisons Market Street": "Morrisons",
+  "Morrisons Nutmeg": "Morrisons", "Nutmeg": "Morrisons",
+
+  // Co-op
+  "Co-op": "Co-op", "Coop": "Co-op", "The Co-operative": "Co-op",
+  "Co-operative": "Co-op", "Co op": "Co-op", "CO-OP": "Co-op",
+  "Co-op Loved by Us": "Co-op", "Loved by Us": "Co-op",
+  "Co-op Irresistible": "Co-op", "Irresistible": "Co-op",
+
+  // Iceland
+  "Iceland": "Iceland", "ICELAND": "Iceland",
+  "The Food Warehouse": "Iceland", "Food Warehouse": "Iceland",
+  "Iceland Foods": "Iceland",
+
+  // Waitrose
+  "Waitrose": "Waitrose", "WAITROSE": "Waitrose",
+  "Waitrose Ltd": "Waitrose", "Waitrose & Partners": "Waitrose",
+  "Waitrose Essential": "Waitrose", "Waitrose Essentials": "Waitrose",
+  "Waitrose duchy": "Waitrose", "Duchy Originals": "Waitrose",
+  "Waitrose Free From": "Waitrose", "Little Waitrose": "Waitrose",
+
+  // Aldi
+  "ALDI": "Aldi", "Aldi": "Aldi",
+  "Specially Selected": "Aldi", "Everyday Essentials": "Aldi",
+  "Just Essentials": "Aldi", "Aldi Specially Selected": "Aldi",
+  "Belmont": "Aldi", "Village Bakery": "Aldi",
+
+  // Lidl
+  "Lidl": "Lidl", "LIDL": "Lidl",
+  "Lidl Plus": "Lidl", "Deluxe": "Lidl",
+  "Milbona": "Lidl", "Favorina": "Lidl", "Crestline": "Lidl",
+
+  // M&S
+  "M&S": "M&S", "M&s": "M&S", "Marks & Spencer": "M&S",
+  "Marks and Spencer": "M&S", "M & S": "M&S",
+  "M&S Food": "M&S", "M&S Simply Food": "M&S",
+  "Per Una": "M&S", "M&S Collection": "M&S",
+
+  // Ocado
+  "Ocado": "Ocado", "OCADO": "Ocado", "Ocado Own": "Ocado",
+
+  // Boots
+  "Boots": "Boots", "BOOTS": "Boots",
+  "Boots Pharmaceuticals": "Boots", "Boots Own": "Boots",
+  "No7": "Boots", "Soap & Glory": "Boots",
+
+  // Superdrug
+  "Superdrug": "Superdrug", "SUPERDRUG": "Superdrug",
+  "B. by Superdrug": "Superdrug", "Studio London": "Superdrug",
+
+  // B&M
+  "B&M": "B&M", "B&M Bargains": "B&M", "B & M": "B&M",
+
+  // Poundland
+  "Poundland": "Poundland", "POUNDLAND": "Poundland",
+
+  // Savers
+  "Savers": "Savers",
+
+  // Holland & Barrett
+  "Holland & Barrett": "Holland & Barrett", "Holland and Barrett": "Holland & Barrett",
+  "H&B": "Holland & Barrett",
+
+  // Amazon
+  "Amazon": "Amazon", "AMAZON": "Amazon",
+  "Amazon Fresh": "Amazon", "Amazon Pantry": "Amazon", "Solimo": "Amazon",
+
+  // eBay
+  "Ebay": "eBay", "eBay": "eBay", "EBAY": "eBay",
+
+  // Others
+  "Birds Eye": "Birds Eye",
+  "Taste Inc": "Taste Inc", "Taste Inc. Protein": "Taste Inc",
+  "Farmfoods": "Farmfoods", "FARMFOODS": "Farmfoods",
+  "Home Bargains": "Home Bargains",
+  "Wilko": "Wilko", "WILKO": "Wilko",
+  "Costco": "Costco",
+  "Spar": "Spar", "SPAR": "Spar",
+  "Londis": "Londis",
+  "Budgens": "Budgens",
+  "Nisa": "Nisa", "NISA": "Nisa",
+  "Premier": "Premier",
+  "McColl's": "McColl's",
+  "One Stop": "One Stop",
+  "Netto": "Netto",
+};
+
+// Keyword fragments → canonical store name, checked in order.
+// Used when exact match fails — tested against lowercased raw store text.
+const STORE_KEYWORDS = [
+  ["asda", "Asda"],
+  ["tesco", "Tesco"],
+  ["sainsbury", "Sainsbury's"],
+  ["morrisons", "Morrisons"],
+  ["co-op", "Co-op"],
+  ["coop", "Co-op"],
+  ["co op", "Co-op"],
+  ["cooperative", "Co-op"],
+  ["iceland", "Iceland"],
+  ["food warehouse", "Iceland"],
+  ["waitrose", "Waitrose"],
+  ["duchy", "Waitrose"],
+  ["aldi", "Aldi"],
+  ["lidl", "Lidl"],
+  ["marks & spencer", "M&S"],
+  ["marks and spencer", "M&S"],
+  ["m&s", "M&S"],
+  ["ocado", "Ocado"],
+  ["boots", "Boots"],
+  ["superdrug", "Superdrug"],
+  ["b&m", "B&M"],
+  ["poundland", "Poundland"],
+  ["holland & barrett", "Holland & Barrett"],
+  ["holland and barrett", "Holland & Barrett"],
+  ["amazon", "Amazon"],
+  ["ebay", "eBay"],
+  ["farmfoods", "Farmfoods"],
+  ["home bargains", "Home Bargains"],
+  ["wilko", "Wilko"],
+  ["costco", "Costco"],
+  ["spar", "Spar"],
+  ["londis", "Londis"],
+  ["budgens", "Budgens"],
+  ["nisa", "Nisa"],
+  ["savers", "Savers"],
+  ["birds eye", "Birds Eye"],
+  ["taste inc", "Taste Inc"],
+  ["one stop", "One Stop"],
+  ["mccoll", "McColl's"],
+];
+
 /**
- * Extract the best image URL from a Next.js product card.
- *
- * Trolley is a Next.js app. next/image wraps real URLs in:
- *   /_next/image?url=<encoded-real-url>&w=96&q=75
- *
- * Before IntersectionObserver fires (lazy load), img.src is a tiny base64
- * blurred placeholder. The real URL is always available in:
- *   img.srcset  →  "/_next/image?url=...&w=96 1x, /_next/image?url=...&w=128 2x"
- *   <source srcset="..."> inside a <picture> wrapper
- *
- * We decode the `url` param to get the actual CDN image URL.
+ * Resolve a raw store string to a canonical store name.
+ * 1. Exact match in STORE_MAP
+ * 2. Keyword substring match (case-insensitive)
+ * 3. Return the raw string capitalised — never "Other"
  */
-function extractImageUrl(card) {
-  // Helper: decode a Next.js image proxy URL → real CDN URL
-  const decodeNextImage = (nextUrl) => {
-    if (!nextUrl) return null;
-    try {
-      // Could be relative /_next/image?url=... or absolute
-      const base = nextUrl.startsWith("http") ? nextUrl : `https://www.trolley.co.uk${nextUrl}`;
-      const parsed = new URL(base);
-      const realUrl = parsed.searchParams.get("url");
-      return realUrl ? decodeURIComponent(realUrl) : null;
-    } catch {
-      return null;
-    }
-  };
+function resolveStore(raw) {
+  if (!raw || !raw.trim()) return "Unknown";
+  const trimmed = raw.trim();
 
-  // Helper: pick the largest width from a srcset string and decode it
-  const bestFromSrcset = (srcset) => {
-    if (!srcset) return null;
-    // srcset entries: "url w1x, url2 w2x"  or  "url 96w, url2 128w"
-    const entries = srcset.split(",").map(s => s.trim()).filter(Boolean);
-    if (!entries.length) return null;
-    // Take the last entry (largest)
-    const url = entries[entries.length - 1].split(/\s+/)[0];
-    return url || null;
-  };
+  // 1. Exact match
+  if (STORE_MAP[trimmed]) return STORE_MAP[trimmed];
 
-  // 1. Try <picture><source srcset="..."> — most reliable for Next.js
-  const source = card.querySelector("picture source");
-  if (source) {
-    const srcset = source.srcset || source.getAttribute("srcset");
-    const url = bestFromSrcset(srcset);
-    if (url) {
-      const decoded = decodeNextImage(url) || url;
-      if (decoded && !decoded.startsWith("data:")) return decoded;
-    }
+  // 2. Keyword match
+  const lower = trimmed.toLowerCase();
+  for (const [kw, canonical] of STORE_KEYWORDS) {
+    if (lower.includes(kw)) return canonical;
   }
 
-  // 2. Try img srcset
-  const img = card.querySelector("img");
-  if (img) {
-    const srcset = img.srcset || img.getAttribute("srcset");
-    const url = bestFromSrcset(srcset);
-    if (url) {
-      const decoded = decodeNextImage(url) || url;
-      if (decoded && !decoded.startsWith("data:")) return decoded;
-    }
-
-    // 3. Try img.src — only useful if IntersectionObserver already fired
-    if (img.src && !img.src.startsWith("data:")) {
-      const decoded = decodeNextImage(img.src) || img.src;
-      if (decoded && decoded.startsWith("http")) return decoded;
-    }
-
-    // 4. data attributes (some lazy loaders)
-    const lazy = img.dataset.src || img.dataset.lazySrc || img.dataset.srcset;
-    if (lazy && !lazy.startsWith("data:")) {
-      const decoded = decodeNextImage(lazy) || lazy;
-      if (decoded) return decoded;
-    }
-  }
-
-  return null;
+  // 3. Keep the raw value — better than "Other"
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BROWSER — single shared Playwright instance
+// BROWSER
 // ─────────────────────────────────────────────────────────────────────────────
 let _browser = null;
 
@@ -136,7 +246,6 @@ async function newPage() {
   });
   const page = await ctx.newPage();
 
-  // Block only fonts/media/stylesheets — allow images so next/image loads
   await page.route("**/*", (route) => {
     const type = route.request().resourceType();
     if (["font", "media", "stylesheet"].includes(type)) {
@@ -150,8 +259,7 @@ async function newPage() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SCROLL-TO-LOAD — trigger IntersectionObserver for lazy images
-// Scrolls through the page in steps so all product images fire their lazy load
+// SCROLL-TO-LOAD
 // ─────────────────────────────────────────────────────────────────────────────
 async function triggerLazyImages(page) {
   await page.evaluate(async () => {
@@ -160,47 +268,20 @@ async function triggerLazyImages(page) {
     const step = Math.floor(window.innerHeight * 0.8);
     for (let y = 0; y < totalHeight; y += step) {
       window.scrollTo(0, y);
-      await delay(120); // small pause for IntersectionObserver callbacks
+      await delay(120);
     }
     window.scrollTo(0, 0);
   });
-  // Give network a moment to respond to triggered image loads
   await page.waitForTimeout(600);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TROLLEY DOM SCRAPER
+// Raw store text is returned from the browser, then resolved server-side
+// using the full STORE_MAP / STORE_KEYWORDS without serialising them.
 // ─────────────────────────────────────────────────────────────────────────────
 async function scrapeTrolley(page) {
-  return page.evaluate(() => {
-    const STORE_MAP = {
-      "Asda": "Asda", "ASDA": "Asda",
-      "Exceptional by ASDA": "Asda", "Exceptional By Asda": "Asda",
-      "Tesco": "Tesco", "Tesco Finest": "Tesco", "Tesco Everyday Value": "Tesco",
-      "Sainsbury's": "Sainsbury's", "Sainsburys": "Sainsbury's",
-      "Sainsbury's Taste the Difference": "Sainsbury's", "Taste the Difference": "Sainsbury's",
-      "Morrisons": "Morrisons", "Morrisons Savers": "Morrisons",
-      "Co-op": "Co-op", "Coop": "Co-op", "The Co-operative": "Co-op",
-      "Iceland": "Iceland", "The Food Warehouse": "Iceland",
-      "Boots": "Boots",
-      "Superdrug": "Superdrug",
-      "ALDI": "Aldi", "Aldi": "Aldi", "Specially Selected": "Aldi",
-      "Waitrose": "Waitrose", "Waitrose Ltd": "Waitrose",
-      "B&M": "B&M",
-      "Poundland": "Poundland",
-      "Savers": "Savers",
-      "Ocado": "Ocado",
-      "Amazon": "Amazon",
-      "Ebay": "eBay", "eBay": "eBay",
-      "M&S": "M&S", "M&s": "M&S", "Marks & Spencer": "M&S",
-      "Lidl": "Lidl",
-      "Holland & Barrett": "Holland & Barrett",
-      "Taste Inc": "Taste Inc", "Taste Inc. Protein": "Taste Inc",
-      "Birds Eye": "Birds Eye",
-    };
-    const KNOWN_STORES = new Set(Object.keys(STORE_MAP));
-
-    // ── Inline image extractor (runs in browser context) ──────────────────
+  const rawItems = await page.evaluate(() => {
     function extractImageUrl(card) {
       const decodeNextImage = (nextUrl) => {
         if (!nextUrl) return null;
@@ -222,7 +303,6 @@ async function scrapeTrolley(page) {
         return url || null;
       };
 
-      // 1. <picture><source srcset>
       const source = card.querySelector("picture source");
       if (source) {
         const url = bestFromSrcset(source.srcset || source.getAttribute("srcset"));
@@ -234,30 +314,23 @@ async function scrapeTrolley(page) {
 
       const img = card.querySelector("img");
       if (img) {
-        // 2. img srcset
         const srcset = img.srcset || img.getAttribute("srcset");
         const url = bestFromSrcset(srcset);
         if (url) {
           const decoded = decodeNextImage(url) || url;
           if (decoded && !decoded.startsWith("data:")) return decoded;
         }
-
-        // 3. img.src (only once lazy-loaded)
         if (img.src && !img.src.startsWith("data:")) {
           const decoded = decodeNextImage(img.src) || img.src;
           if (decoded && decoded.startsWith("http")) return decoded;
         }
-
-        // 4. data-* lazy attributes
         const lazy = img.dataset.src || img.dataset.lazySrc || img.dataset.srcset;
         if (lazy && !lazy.startsWith("data:")) {
           return decodeNextImage(lazy) || lazy;
         }
       }
-
       return null;
     }
-    // ─────────────────────────────────────────────────────────────────────
 
     const items = [];
     const cards = document.querySelectorAll(".product-item");
@@ -267,7 +340,6 @@ async function scrapeTrolley(page) {
       if (!raw) continue;
 
       const lines = raw.split(/\n/).map(l => l.trim()).filter(Boolean);
-
       const priceLineIdx = lines.findIndex(l => /^£[\d]+\.[\d]{2}$/.test(l));
       if (priceLineIdx === -1) continue;
 
@@ -275,11 +347,15 @@ async function scrapeTrolley(page) {
       const unitLine = lines[priceLineIdx + 1] || "";
       const unit = /per/.test(unitLine) ? unitLine : "";
 
-      let store = "Other";
+      // Grab the raw store text — resolved server-side
+      let rawStore = "";
       let storeLineIdx = -1;
-      for (let i = 0; i < priceLineIdx; i++) {
-        if (KNOWN_STORES.has(lines[i])) {
-          store = STORE_MAP[lines[i]];
+      for (let i = 0; i < priceLineIdx && i <= 2; i++) {
+        const l = lines[i];
+        if (/^\d+$/.test(l)) continue;
+        if (/^\d+(g|ml|kg|l|L)$/i.test(l)) continue;
+        if (l.length >= 2 && l.length <= 50) {
+          rawStore = l;
           storeLineIdx = i;
           break;
         }
@@ -289,7 +365,7 @@ async function scrapeTrolley(page) {
       for (let i = 0; i < priceLineIdx; i++) {
         if (i === storeLineIdx) continue;
         if (/^\d+$/.test(lines[i])) continue;
-        if (/^\d+(g|ml|kg|l|L)$/.test(lines[i])) continue;
+        if (/^\d+(g|ml|kg|l|L)$/i.test(lines[i])) continue;
         if (lines[i].length < 4) continue;
         if (!productName || lines[i].length > productName.length) {
           productName = lines[i];
@@ -298,24 +374,31 @@ async function scrapeTrolley(page) {
 
       if (!productName) continue;
 
-      const imageUrl = extractImageUrl(card);
-
       items.push({
         name: productName.slice(0, 150),
-        store,
+        rawStore,
         price,
         unit,
-        imageUrl: imageUrl || null,
+        imageUrl: extractImageUrl(card) || null,
       });
     }
 
     const seen = new Map();
     for (const item of items) {
-      const key = `${item.name}|${item.store}|${item.price}`;
+      const key = `${item.name}|${item.rawStore}|${item.price}`;
       if (!seen.has(key)) seen.set(key, item);
     }
     return [...seen.values()];
   });
+
+  // Resolve stores server-side
+  return rawItems.map(item => ({
+    name: item.name,
+    store: resolveStore(item.rawStore),
+    price: item.price,
+    unit: item.unit,
+    imageUrl: item.imageUrl,
+  }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,7 +417,6 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
       page.waitForTimeout(8000),
     ]).catch(() => {});
 
-    // Scroll to trigger lazy image loading, then scroll back
     await triggerLazyImages(page);
 
     const initialCount = await page.$$eval(".product-item", els => els.length);
@@ -352,8 +434,12 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
         return true;
       });
 
-      // Log image extraction success rate for debugging
       const withImages = newItems.filter(r => r.imageUrl).length;
+      // Log any store names that still didn't resolve to a known canonical
+      const allCanonical = new Set([...Object.values(STORE_MAP), ...STORE_KEYWORDS.map(([,c]) => c)]);
+      const unresolved = [...new Set(newItems.map(r => r.store).filter(s => !allCanonical.has(s)))];
+      if (unresolved.length) console.log(`  Unresolved stores (will add to map): ${unresolved.join(", ")}`);
+
       console.log(`  Batch: ${newItems.length} new items, ${withImages} with images`);
 
       allResults = [...allResults, ...newItems];
@@ -386,14 +472,13 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
         ".product-item"
       ).catch(() => {});
 
-      // Scroll to trigger lazy images on newly loaded cards
       await triggerLazyImages(page);
 
       const newCount = await page.$$eval(".product-item", els => els.length);
       console.log(`  Trolley click ${i + 1}: ${newCount} products`);
 
       const isLast = i === clicks - 1;
-      const added = await emitBatch(isLast);
+      await emitBatch(isLast);
 
       if (newCount === prevCount) {
         console.log(`  Trolley: no new products loaded, stopping`);
@@ -434,12 +519,12 @@ app.get("/", (_, res) => {
     "  GET  /search?q=milk[&clicks=4]\n" +
     "  GET  /search/stream?q=milk[&clicks=4]   ← SSE streaming\n" +
     "  POST /compare  { items: ['milk','bread'], clicks: 4 }\n" +
+    "  GET  /debug-stores?q=milk               ← inspect raw vs resolved store names\n" +
     "  GET  /debug-images?q=milk               ← inspect image extraction\n" +
     "  GET  /debug?q=chicken"
   );
 });
 
-// ── Non-streaming search ───────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
@@ -453,7 +538,6 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ── SSE streaming search ───────────────────────────────────────────────────
 app.get("/search/stream", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing ?q= param" });
@@ -513,7 +597,57 @@ app.post("/compare", async (req, res) => {
   }
 });
 
-// ── Debug: raw image extraction report ────────────────────────────────────
+// ── Debug: raw vs resolved store names ────────────────────────────────────
+// Hit /debug-stores?q=chicken to see what raw text Trolley shows and how
+// it resolves. Any "Unresolved" entries should be added to STORE_MAP.
+app.get("/debug-stores", async (req, res) => {
+  const query = req.query.q || "milk";
+  const { page, ctx } = await newPage();
+  try {
+    await page.goto(
+      `https://www.trolley.co.uk/search/?q=${encodeURIComponent(query)}`,
+      { waitUntil: "domcontentloaded", timeout: 25000 }
+    );
+    await Promise.race([
+      page.waitForSelector(".product-item", { timeout: 10000 }),
+      page.waitForTimeout(8000),
+    ]).catch(() => {});
+    await triggerLazyImages(page);
+
+    const rawStores = await page.evaluate(() => {
+      const stores = [];
+      for (const card of document.querySelectorAll(".product-item")) {
+        const lines = (card.innerText || "").split(/\n/).map(l => l.trim()).filter(Boolean);
+        const priceIdx = lines.findIndex(l => /^£[\d]+\.[\d]{2}$/.test(l));
+        if (priceIdx === -1) continue;
+        for (let i = 0; i < priceIdx && i <= 2; i++) {
+          const l = lines[i];
+          if (l.length >= 2 && l.length <= 50 && !/^\d/.test(l)) {
+            stores.push(l);
+            break;
+          }
+        }
+      }
+      return stores;
+    });
+
+    const freq = {};
+    for (const s of rawStores) freq[s] = (freq[s] || 0) + 1;
+
+    const allCanonical = new Set([...Object.values(STORE_MAP), ...STORE_KEYWORDS.map(([,c]) => c)]);
+    const resolved = Object.entries(freq).map(([raw, count]) => {
+      const r = resolveStore(raw);
+      return { raw, resolved: r, count, known: allCanonical.has(r) };
+    }).sort((a, b) => b.count - a.count);
+
+    res.json({ query, totalCards: rawStores.length, stores: resolved });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+});
+
 app.get("/debug-images", async (req, res) => {
   const query = req.query.q || "milk";
   const { page, ctx } = await newPage();
@@ -527,7 +661,6 @@ app.get("/debug-images", async (req, res) => {
       page.waitForTimeout(8000),
     ]).catch(() => {});
 
-    // Report BEFORE scroll
     const beforeScroll = await page.evaluate(() => {
       const cards = [...document.querySelectorAll(".product-item")].slice(0, 3);
       return cards.map(card => {
@@ -543,10 +676,8 @@ app.get("/debug-images", async (req, res) => {
       });
     });
 
-    // Scroll to trigger lazy load
     await triggerLazyImages(page);
 
-    // Report AFTER scroll
     const afterScroll = await page.evaluate(() => {
       const cards = [...document.querySelectorAll(".product-item")].slice(0, 3);
       return cards.map(card => {
@@ -560,7 +691,6 @@ app.get("/debug-images", async (req, res) => {
       });
     });
 
-    // Full scrape
     const results = await scrapeTrolley(page);
     const withImages = results.filter(r => r.imageUrl).length;
 
@@ -573,10 +703,7 @@ app.get("/debug-images", async (req, res) => {
       rawImgAttrsBeforeScroll: beforeScroll,
       rawImgAttrsAfterScroll: afterScroll,
       sampleResults: results.slice(0, 5).map(r => ({
-        name: r.name,
-        store: r.store,
-        price: r.price,
-        imageUrl: r.imageUrl,
+        name: r.name, store: r.store, price: r.price, imageUrl: r.imageUrl,
       })),
     });
   } catch (err) {
@@ -586,7 +713,6 @@ app.get("/debug-images", async (req, res) => {
   }
 });
 
-// ── Debug: general DOM inspection ─────────────────────────────────────────
 app.get("/debug", async (req, res) => {
   const query = req.query.q || "milk";
   const { page, ctx } = await newPage();
