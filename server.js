@@ -27,6 +27,38 @@ function findCheapest(results) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PRICE CACHE
+// In-memory cache keyed by normalised query string.
+// Each entry: { results, cheapest, cachedAt }
+// TTL: 2 hours — prices are unlikely to change faster than that.
+// In-flight deduplication: if the same query is already being scraped,
+// subsequent requests wait for the first one to finish rather than
+// launching a second browser session.
+// ─────────────────────────────────────────────────────────────────────────────
+const CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+const priceCache = new Map();   // query → { results, cheapest, cachedAt }
+const inFlight   = new Map();   // query → Promise<{ results, cheapest }>
+
+function cacheKey(query) {
+  return query.trim().toLowerCase();
+}
+
+function getCached(query) {
+  const entry = priceCache.get(cacheKey(query));
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > CACHE_TTL_MS) {
+    priceCache.delete(cacheKey(query));
+    return null;
+  }
+  return entry;
+}
+
+function setCached(query, results, cheapest) {
+  priceCache.set(cacheKey(query), { results, cheapest, cachedAt: Date.now() });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STORE RESOLUTION
 // Exact map first, then keyword matching so sub-brands ("Tesco Finest",
 // "Sainsbury's Taste the Difference", etc.) always resolve to a known store.
@@ -499,15 +531,52 @@ async function searchTrolley(query, clicks = 4, onBatch = null) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGGREGATE
+// AGGREGATE  (with cache + in-flight deduplication)
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchAll(query, clicks = 4, onBatch = null) {
-  console.log(`\nSearching: "${query}" (up to ${clicks} load-more clicks)`);
-  const results = await searchTrolley(query, clicks, onBatch);
-  const byStore = {};
-  for (const r of results) byStore[r.store] = (byStore[r.store] || 0) + 1;
-  console.log("  By store:", JSON.stringify(byStore));
-  return results;
+  const key = cacheKey(query);
+
+  // ── Cache hit: replay results instantly via onBatch then return ───────────
+  const cached = getCached(query);
+  if (cached) {
+    const ageMin = Math.round((Date.now() - cached.cachedAt) / 60000);
+    console.log(`\nCache HIT "${query}" (${ageMin}m old, ${cached.results.length} results)`);
+    if (onBatch) onBatch(cached.results, cached.results, true);
+    return cached.results;
+  }
+
+  // ── In-flight deduplication: if scrape is already running, wait for it ───
+  if (inFlight.has(key)) {
+    console.log(`\nIn-flight HIT "${query}" — waiting for existing scrape`);
+    const { results, cheapest } = await inFlight.get(key);
+    if (onBatch) onBatch(results, results, true);
+    return results;
+  }
+
+  // ── Cache miss: scrape and populate cache ────────────────────────────────
+  console.log(`\nCache MISS "${query}" — scraping (up to ${clicks} load-more clicks)`);
+
+  let resolveFlight, rejectFlight;
+  const flightPromise = new Promise((res, rej) => { resolveFlight = res; rejectFlight = rej; });
+  inFlight.set(key, flightPromise);
+
+  try {
+    const results = await searchTrolley(query, clicks, onBatch);
+    const cheapest = findCheapest(results);
+    setCached(query, results, cheapest);
+
+    const byStore = {};
+    for (const r of results) byStore[r.store] = (byStore[r.store] || 0) + 1;
+    console.log("  By store:", JSON.stringify(byStore));
+
+    resolveFlight({ results, cheapest });
+    return results;
+  } catch (err) {
+    rejectFlight(err);
+    throw err;
+  } finally {
+    inFlight.delete(key);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -519,10 +588,43 @@ app.get("/", (_, res) => {
     "  GET  /search?q=milk[&clicks=4]\n" +
     "  GET  /search/stream?q=milk[&clicks=4]   ← SSE streaming\n" +
     "  POST /compare  { items: ['milk','bread'], clicks: 4 }\n" +
-    "  GET  /debug-stores?q=milk               ← inspect raw vs resolved store names\n" +
-    "  GET  /debug-images?q=milk               ← inspect image extraction\n" +
+    "  GET  /cache                             ← list cached queries\n" +
+    "  DEL  /cache                             ← clear all cache\n" +
+    "  DEL  /cache?q=milk                      ← clear one entry\n" +
+    "  GET  /debug-stores?q=milk\n" +
+    "  GET  /debug-images?q=milk\n" +
     "  GET  /debug?q=chicken"
   );
+});
+
+// ── Cache inspection / management ─────────────────────────────────────────
+app.get("/cache", (req, res) => {
+  const now = Date.now();
+  const entries = [...priceCache.entries()].map(([key, entry]) => ({
+    query: key,
+    results: entry.results.length,
+    cachedAt: new Date(entry.cachedAt).toISOString(),
+    ageMinutes: Math.round((now - entry.cachedAt) / 60000),
+    expiresInMinutes: Math.round((CACHE_TTL_MS - (now - entry.cachedAt)) / 60000),
+  }));
+  res.json({
+    entries: entries.length,
+    ttlHours: CACHE_TTL_MS / 3600000,
+    inFlight: [...inFlight.keys()],
+    cache: entries,
+  });
+});
+
+app.delete("/cache", (req, res) => {
+  if (req.query.q) {
+    const key = cacheKey(req.query.q);
+    const existed = priceCache.has(key);
+    priceCache.delete(key);
+    return res.json({ cleared: existed ? [key] : [], total: priceCache.size });
+  }
+  const keys = [...priceCache.keys()];
+  priceCache.clear();
+  res.json({ cleared: keys, total: 0 });
 });
 
 app.get("/search", async (req, res) => {
@@ -547,6 +649,8 @@ app.get("/search/stream", async (req, res) => {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+  // Let the client know if this is a cache hit (results arrive instantly)
+  res.setHeader("X-Cache", getCached(query) ? "HIT" : "MISS");
   res.flushHeaders();
   res.write(": connected\n\n");
 
